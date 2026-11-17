@@ -71,3 +71,18 @@ export function docToJsonText(archivo, opciones) {
 export async function docToJson(archivo, opciones) {
   return JSON.parse(await docToJsonText(archivo, opciones));
 }
+
+/** Convierte un .docx o un .pdf en Markdown: titulos, listas, tablas GFM y notas al pie. */
+export function docToMarkdown(archivo) {
+  return convertir(archivo, 2);
+}
+
+/**
+ * Corta un .docx o un .pdf en fragmentos de hasta `maxChars` caracteres (2000 por defecto), con
+ * la ruta de titulos de su seccion y las paginas que cubren. Listo para indexar o enviar a un modelo.
+ */
+export async function docToChunks(archivo, opciones) {
+  const n = Math.floor((opciones && opciones.maxChars) || 0);
+  if (n < 0 || n > 0xffffff) throw new RangeError('maxChars debe estar entre 1 y 16777215.');
+  return JSON.parse(await convertir(archivo, 3 + n * 256));
+}

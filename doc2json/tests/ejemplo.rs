@@ -8,6 +8,37 @@ fn ejemplo(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("no se pudo leer {}: {}", path.display(), e))
 }
 
+#[test]
+fn markdown_de_ejemplo() {
+    // El Markdown guardado en ejemplo/ es la referencia (titulos, listas, tabla GFM, nota al pie).
+    for name in ["procedimiento.docx", "procedimiento.pdf"] {
+        let md = doc2json::to_markdown(&ejemplo(name)).unwrap();
+        let esperado = String::from_utf8(ejemplo(&format!("{}.md", name))).unwrap();
+        assert_eq!(md, esperado, "{}", name);
+    }
+    let md = doc2json::to_markdown(&ejemplo("procedimiento.docx")).unwrap();
+    assert!(md.starts_with("# Procedimiento de bloqueo de equipos\n\n## Objetivo\n"));
+    assert!(md.contains("| Cargo | Tarea | Registro |\n| --- | --- | --- |\n| Supervisor | Autoriza el bloqueo | Permiso de trabajo |"));
+    assert!(md.contains("un equipo.[^1]") && md.contains("[^1]: Aplica a energ"));
+    assert!(md.contains("**Importante:** nadie retira"));
+}
+
+#[test]
+fn fragmentos_de_ejemplo() {
+    let d = doc2json::read(&ejemplo("procedimiento.docx")).unwrap();
+    let c = doc2json::markdown::chunks(&d, 300);
+    assert!(c.len() >= 3);
+    assert!(c.iter().all(|x| x.text.chars().count() <= 300));
+    assert!(c.iter().any(|x| x.path.last().map(String::as_str) == Some("Responsables") && x.text.contains("| Supervisor |")));
+    // Todo el contenido llega a algun fragmento.
+    let todo: String = c.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join("\n");
+    for frase in ["Detener el equipo", "Empresas colaboradoras", "Tarjeta personal", "nadie retira un candado"] {
+        assert!(todo.contains(frase), "{}", frase);
+    }
+    let j = doc2json::to_chunks_json(&ejemplo("procedimiento.pdf"), 0).unwrap();
+    assert!(j.starts_with("{\"type\":\"pdf\"") && j.contains("\"pages\":[1,1]"));
+}
+
 fn count(blocks: &[Block], kind: Kind) -> usize {
     blocks.iter().filter(|b| b.kind == kind).count()
 }

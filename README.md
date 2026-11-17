@@ -29,9 +29,17 @@ target\release\doc2json.exe informe.pdf
 target\release\doc2json.exe contrato.docx salida.json --full
 ```
 
+```bash
+target\release\doc2json.exe informe.pdf --markdown
+```
+
+```bash
+target\release\doc2json.exe manual.docx --fragmentos=1500
+```
+
 **En una página web:** copia a tu proyecto los archivos de `web/` y llama a los cargadores como se muestra en [Integración en una web](#integración-en-una-web-vercel--supabase). La conversión ocurre en el navegador; el archivo no se sube a ningún lado.
 
-En `ejemplo/` hay un procedimiento de muestra en `.docx` y `.pdf` con sus JSON.
+En `ejemplo/` hay un procedimiento de muestra en `.docx` y `.pdf` con sus JSON y su Markdown.
 
 ---
 
@@ -93,6 +101,23 @@ Los dos formatos salen con **la misma forma**, así una sola tabla en la base de
 | `warnings` | Avisos: páginas escaneadas sin texto, índice reconstruido, fuentes ilegibles. |
 
 Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de cada bloque, los tramos con formato (negrita, cursiva, enlaces) y, en PDF, cada línea con su posición y tamaño de letra.
+
+### Markdown y fragmentos (para modelos de lenguaje y búsqueda)
+
+Los mismos bloques salen también como **Markdown** (`--markdown`, `docToMarkdown`): títulos con `#` según su nivel, listas con su numeración o viñeta e indentación, tablas GFM (las celdas combinadas dejan su lugar vacío, sin filas ni columnas en blanco), notas al pie como `[^1]` y, en Word, **negrita**, *cursiva* y enlaces. En PDF cada página empieza con `<!-- pagina N -->`, para citar de dónde sale cada parte.
+
+Y como **fragmentos** listos para indexar o enviar a un modelo (`--fragmentos[=N]`, `docToChunks`), de hasta N caracteres (2000 por defecto, unos 500 tokens en castellano):
+
+```json
+{ "type": "docx", "metadata": { … }, "page_count": 30,
+  "chunks": [ { "index": 4, "path": ["3. DEFINICIONES Y TÉRMINOS"], "chars": 1821, "text": "**AST**\n\n- Análisis de Seguridad en el Trabajo. …" } ] }
+```
+
+- Cada fragmento empieza en un título cuando se puede y trae en `path` los títulos de las secciones que lo contienen; en PDF, `pages` con la primera y la última página.
+- Nunca corta un bloque, salvo que el bloque solo sea más grande que el fragmento: un párrafo se corta al final de una oración, una tabla por filas repitiendo el encabezado, y una fila con una celda enorme en filas de continuación con las mismas columnas.
+- Una sección más corta que 200 caracteres se junta con la siguiente; un título queda con el bloque que lo sigue.
+- Muchas plantillas escriben los títulos de sección como una tabla de una sola celda ("1. OBJETIVO"): se tratan como título, con el nivel que dé su numeración.
+- Las notas al pie van en un fragmento final con ruta `["Notas"]`.
 
 ### Word (.docx)
 
@@ -161,11 +186,15 @@ async function convertirPlan(file: File) {
 
 ```tsx
 'use client';
-import { init, docToJson } from '@/lib/doc2json';
+import { init, docToJson, docToMarkdown, docToChunks } from '@/lib/doc2json';
 
 async function convertirDocumento(file: File) {
   await init('/doc2json.wasm');
-  return docToJson(new Uint8Array(await file.arrayBuffer()));   // { type, metadata, content, text, ... }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const doc = await docToJson(bytes);                            // { type, metadata, content, text, ... }
+  const md = await docToMarkdown(bytes);                         // Markdown con tablas GFM
+  const { chunks } = await docToChunks(bytes, { maxChars: 1500 }); // [{ path, pages, text, ... }]
+  return { doc, md, chunks };
 }
 ```
 
@@ -358,6 +387,7 @@ node web/prueba.mjs
 **doc2json**
 
 - **No hace OCR.** Un PDF escaneado (solo imagen) no tiene texto que extraer; se informa en `warnings`.
+- Fragmentos: el tamaño máximo se respeta siempre, salvo una fila de una tabla muy ancha (decenas de columnas con texto) con un tamaño chico, donde ni repartiéndola cabe junto al encabezado. Probado con 896 documentos reales: 0 fragmentos sobre el máximo con 2000 caracteres y 1 de 57.558 con 800.
 - En PDF sin etiquetas la estructura es una deducción. Funciona bien en documentos de oficina, informes y certificados; puede equivocarse con diseños muy libres (afiches, planos, revistas a varias columnas con recuadros).
 - En PDF sin etiquetas las tablas se detectan por alineación del texto, no por sus líneas dibujadas. Una tabla con celdas de varias líneas puede salir partida en más filas.
 - En PDF etiquetado vale lo que diga el etiquetado. Word no exporta las combinaciones verticales de celdas (`RowSpan`), así que esas celdas salen vacías en vez de `merged`. No se leen las etiquetas de formularios incrustados (`/Stm`) ni las anotaciones referidas desde el árbol (`OBJR`): su texto igual se recupera por posición.
@@ -421,6 +451,7 @@ doc2json/src/           doc2json
     layout.rs           de letras con coordenadas a líneas, párrafos y tablas
     structure.rs        PDF etiquetado: árbol de estructura a títulos, listas, tablas y notas
   doc.rs                modelo común de documento y salida JSON
+  markdown.rs           Markdown (tablas GFM, notas) y fragmentos por sección
   symbols.rs            fuentes Symbol y Wingdings a Unicode
 doc2json/tests/
   ejemplo.rs            pruebas de punta a punta con los archivos de ejemplo/

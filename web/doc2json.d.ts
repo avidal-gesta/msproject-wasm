@@ -18,6 +18,43 @@ export declare function docToJsonText(file: FileInput, options?: JsonOptions): P
 /** Convierte un .docx o un .pdf en un objeto con metadatos, bloques de contenido y texto plano. */
 export declare function docToJson(file: FileInput, options?: JsonOptions): Promise<DocDocument>;
 
+/**
+ * Convierte un .docx o un .pdf en Markdown: titulos con `#`, listas con su numeracion, tablas GFM,
+ * notas al pie como `[^1]` y, en Word, negrita, cursiva y enlaces. En PDF cada pagina empieza con
+ * `<!-- pagina N -->`.
+ */
+export declare function docToMarkdown(file: FileInput): Promise<string>;
+
+export interface ChunkOptions {
+  /** Tamano maximo de cada fragmento, en caracteres. Por defecto 2000 (unos 500 tokens en castellano); minimo 200. */
+  maxChars?: number;
+}
+
+export interface DocChunk {
+  index: number;
+  /** Titulos de las secciones que contienen el fragmento, del mas general al mas especifico. */
+  path: string[];
+  /** Solo PDF: primera y ultima pagina que cubre. */
+  pages?: [number, number];
+  chars: number;
+  /** El fragmento en Markdown. */
+  text: string;
+}
+
+export interface DocChunks {
+  type: 'docx' | 'pdf';
+  metadata: DocMetadata;
+  page_count: number | null;
+  chunks: DocChunk[];
+}
+
+/**
+ * Corta un .docx o un .pdf en fragmentos para indexar o enviar a un modelo: cada uno empieza en un
+ * titulo cuando se puede, nunca corta un bloque (salvo uno mas grande que el fragmento) y las tablas
+ * largas se parten por filas repitiendo el encabezado.
+ */
+export declare function docToChunks(file: FileInput, options?: ChunkOptions): Promise<DocChunks>;
+
 /** Propiedades del archivo. Solo aparecen las que el documento trae; las fechas van en ISO 8601. */
 export interface DocMetadata {
   title?: string;

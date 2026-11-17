@@ -41,7 +41,13 @@ for (const nombre of ['procedimiento.docx', 'procedimiento.pdf']) {
   const objeto = await doc.docToJson(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
   comprobar(`${nombre}: objeto desde un ArrayBuffer`, objeto.type === nombre.split('.').pop() && objeto.content.length > 0);
   comprobar(`${nombre}: la salida completa trae mas datos`, (await doc.docToJsonText(bytes, { full: true })).length > texto.length);
+  const md = await doc.docToMarkdown(bytes);
+  comprobar(`${nombre}: Markdown identico al de ejemplo/`, md === (await readFile(path.join(ejemplo, `${nombre}.md`), 'utf8')));
+  const frag = await doc.docToChunks(bytes, { maxChars: 300 });
+  comprobar(`${nombre}: fragmentos con ruta de titulos y sin pasar el maximo`, frag.chunks.length >= 3 && frag.chunks.every((c) => c.chars <= 300 && Array.isArray(c.path)) && frag.chunks.some((c) => c.path.includes('Responsables')));
 }
+
+comprobar('docToChunks rechaza un tamano fuera de rango', /maxChars/.test(await mensajeDeError(doc.docToChunks(new Uint8Array(4), { maxChars: -1 }))));
 
 comprobar('doc2json rechaza un archivo que no es documento', /no reconocido/.test(await mensajeDeError(doc.docToJson(new TextEncoder().encode('hola mundo')))));
 comprobar('doc2json rechaza un archivo vacio', /vac/.test(await mensajeDeError(doc.docToJson(new Uint8Array(0)))));

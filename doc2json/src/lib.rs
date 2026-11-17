@@ -14,6 +14,7 @@ pub mod doc;
 pub mod docx;
 pub mod inflate;
 pub mod json;
+pub mod markdown;
 pub mod pdf;
 pub mod symbols;
 #[cfg(target_arch = "wasm32")]
@@ -59,4 +60,17 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
 /// texto y, en PDF, las lineas de cada pagina con su posicion.
 pub fn to_json(bytes: &[u8], full: bool) -> Result<String, String> {
     Ok(doc::to_json(&read(bytes)?, full))
+}
+
+/// Convierte un documento a Markdown (tablas GFM, notas al pie, marcas de pagina en PDF).
+pub fn to_markdown(bytes: &[u8]) -> Result<String, String> {
+    Ok(markdown::to_markdown(&read(bytes)?))
+}
+
+/// Convierte un documento en fragmentos de hasta `max_chars` caracteres, en JSON, con la ruta
+/// de titulos y las paginas de cada uno. `0` usa el tamano por defecto.
+pub fn to_chunks_json(bytes: &[u8], max_chars: usize) -> Result<String, String> {
+    let d = read(bytes)?;
+    let size = if max_chars == 0 { markdown::DEFAULT_CHUNK } else { max_chars };
+    Ok(markdown::chunks_json(&d, &markdown::chunks(&d, size)))
 }
