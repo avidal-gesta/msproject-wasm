@@ -141,13 +141,17 @@ pub(crate) fn roman(mut n: i64, upper: bool) -> String {
     }
 }
 
-/// a, b, ..., z, aa, bb, ... (asi numera Word).
+/// Vueltas del abecedario que se escriben como letras; despues, cifras.
+const MAX_LETTER_ROUNDS: i64 = 30;
+
+/// a, b, ..., z, aa, bb, ... (asi numera Word). El numero viene del archivo (`w:start`,
+/// `startAt`): pasadas 30 vueltas (780) se escribe en cifras, para no armar cadenas enormes.
 pub(crate) fn letters(n: i64, upper: bool) -> String {
-    if n <= 0 {
+    if n <= 0 || n > 26 * MAX_LETTER_ROUNDS {
         return n.to_string();
     }
     let c = (b'a' + ((n - 1) % 26) as u8) as char;
-    let s: String = std::iter::repeat(c).take(((n - 1) / 26 + 1) as usize).collect();
+    let s = c.to_string().repeat(((n - 1) / 26 + 1) as usize);
     if upper {
         s.to_uppercase()
     } else {
@@ -940,6 +944,10 @@ mod tests {
     fn numeros() {
         assert_eq!(roman(4, false), "iv");
         assert_eq!(roman(1994, true), "MCMXCIV");
+        assert_eq!(letters(27, false), "aa");
+        assert_eq!(letters(780, true), "Z".repeat(30));
+        assert_eq!(letters(781, false), "781");
+        assert_eq!(letters(i64::MAX, false), i64::MAX.to_string());
         assert_eq!(letters(1, false), "a");
         assert_eq!(letters(27, true), "AA");
         assert_eq!(format_number(3, "decimalZero"), "03");

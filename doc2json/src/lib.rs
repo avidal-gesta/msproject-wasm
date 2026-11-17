@@ -72,7 +72,13 @@ fn office_kind(bytes: &[u8]) -> Format {
             Format::Docx
         };
     };
-    let main = docx::relationships(&zip, "_rels/.rels").into_iter().find(|r| r.1 == "officeDocument").map(|r| docx::resolve("", &r.2));
+    // La parte principal declarada cuenta solo si existe: un paquete con una relacion rota sigue
+    // reconociendose por sus carpetas, como lo hace cada lector.
+    let main = docx::relationships(&zip, "_rels/.rels")
+        .into_iter()
+        .find(|r| r.1 == "officeDocument")
+        .map(|r| docx::resolve("", &r.2))
+        .filter(|p| zip.find(p).is_some());
     let by_path = |p: &str| {
         if p.starts_with("ppt/") {
             Some(Format::Pptx)
@@ -87,7 +93,9 @@ fn office_kind(bytes: &[u8]) -> Format {
     if let Some(f) = main.as_deref().and_then(by_path) {
         return f;
     }
-    if zip.find("ppt/presentation.xml").is_some() {
+    if zip.find("word/document.xml").is_some() {
+        Format::Docx
+    } else if zip.find("ppt/presentation.xml").is_some() {
         Format::Pptx
     } else if zip.find("xl/workbook.xml").is_some() {
         Format::Xlsx

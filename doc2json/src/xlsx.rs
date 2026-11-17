@@ -6,8 +6,13 @@
 //! o falso y errores tal cual. De las formulas se toma el ultimo valor calculado que guardo Excel.
 //!
 //! Las filas y columnas vacias se quitan (tambien las intermedias), igual que las celdas vacias
-//! al final de cada fila, y las celdas combinadas pasan a `colspan`/`rowspan` como en Word. `page` es el numero de la hoja. Las hojas ocultas, los
-//! graficos y las imagenes no se leen.
+//! al final de cada fila, y las celdas combinadas pasan a `colspan`/`rowspan` como en Word.
+//! `page` es el numero de la hoja. Las hojas ocultas, los graficos y las imagenes no se leen.
+//!
+//! Una hoja muy dispersa (pocas celdas en un rango grande, como una diagonal) no se arma como
+//! tabla, que tendria filas por columnas celdas casi todas vacias: sale como tabla de dos columnas,
+//! referencia y valor ("B2", "123"), con un aviso. Los topes de celdas leidas y de celdas de
+//! tabla valen para todo el libro, no por hoja, y una hoja referida varias veces se lee una vez.
 //!
 //! Los nombres de las etiquetas se comparan sin prefijo: algunos programas escriben `<x:row>`.
 
@@ -18,12 +23,23 @@ use crate::xml::{Ev, Xml};
 use crate::zipread::ZipArchive;
 use std::collections::HashMap;
 
-/// Tope de celdas con valor que se leen por hoja; el resto se omite con un aviso.
+/// Tope de celdas con valor que se leen en todo el libro; el resto se omite con un aviso.
 const MAX_CELLS: usize = 2_000_000;
-/// Tope de celdas (filas por columnas, ya sin las vacias) de la tabla de una hoja: las celdas
-/// vacias intermedias tambien ocupan memoria y salida. Pasado el tope se cortan filas. Las hojas
-/// reales mas anchas vistas (formulas copiadas hasta la ultima columna) llegan a 3,7 millones.
+/// Tope de celdas (filas por columnas, ya sin las vacias) de las tablas de todo el libro: las
+/// celdas vacias intermedias tambien ocupan memoria y salida. Pasado el tope se cortan filas. Las
+/// hojas reales mas anchas vistas (formulas copiadas hasta la ultima columna) llegan a 3,7 millones.
 const MAX_GRID: usize = 4_000_000;
+/// Una hoja cuya tabla tendria mas de `SPARSE_RATIO` celdas por cada valor (y mas de
+/// `SPARSE_MIN_GRID` en total) sale como lista de referencia y valor.
+const SPARSE_RATIO: usize = 16;
+const SPARSE_MIN_GRID: usize = 100_000;
+/// Trabajo maximo (celdas recorridas) al ubicar las combinaciones, por cada celda de la tabla.
+const MERGE_WORK: usize = 4;
+/// Tope de hojas distintas que se leen.
+const MAX_SHEETS: usize = 4096;
+/// Ultima fila y cantidad de columnas de Excel (XFD1048576).
+const MAX_ROW: usize = 1_048_576;
+const MAX_COL: usize = 16_384;
 
 /// Nombre de la etiqueta sin su prefijo de espacio de nombres.
 fn local(name: &str) -> &str {
@@ -185,13 +201,18 @@ pub(crate) fn excel_date(serial: f64, date1904: bool) -> String {
     let mut days = seconds.div_euclid(86_400);
     seconds = seconds.rem_euclid(86_400);
     let time = format!("{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
-    if days == 0 && !date1904 {
+    // Una hora sin dia (0 < serie < 1) es una hora pura en los dos sistemas. La serie 0 justa
+    // en el sistema 1904 es una fecha (1904-01-01).
+    if days == 0 && (seconds != 0 || !date1904) {
         return time;
     }
     if date1904 {
         days += 1462;
+    } else if days == 60 {
+        // Excel cuenta un 29-02-1900 que no existio (heredado de Lotus 1-2-3) y lo muestra asi.
+        return if seconds == 0 { "1900-02-29".into() } else { format!("1900-02-29T{}", time) };
     } else if days < 60 {
-        // Excel cuenta un 29-02-1900 que no existio: antes de esa fecha el desfase es un dia menos.
+        // Antes de ese dia ficticio el desfase es un dia menos.
         days += 1;
     }
     // Serie 25569 = 1970-01-01 en el sistema 1900.
@@ -248,10 +269,25 @@ fn cell_ref(r: &str) -> Option<(usize, usize)> {
     }
     let col = r[..letters].bytes().fold(0usize, |acc, b| acc * 26 + (b.to_ascii_uppercase() - b'A' + 1) as usize) - 1;
     let row = r[letters..].parse::<usize>().ok()?;
-    if row == 0 {
+    // Fuera del rango de Excel (A1:XFD1048576): no es una referencia valida.
+    if row == 0 || row > MAX_ROW || col >= MAX_COL {
         return None;
     }
     Some((col, row))
+}
+
+/// Letras de una columna (desde 0): 0 = A, 27 = AB.
+fn col_name(mut col: usize) -> String {
+    let mut s = Vec::new();
+    loop {
+        s.push(b'A' + (col % 26) as u8);
+        if col < 26 {
+            break;
+        }
+        col = col / 26 - 1;
+    }
+    s.reverse();
+    String::from_utf8(s).unwrap_or_default()
 }
 
 /// Texto de un `si` o `is` (ya abierto, de nombre `end`): los `t`, sin la guia fonetica (`rPh`).
@@ -350,7 +386,8 @@ struct Sheet {
     truncated: bool,
 }
 
-fn read_sheet(src: &str, ctx: &Ctx) -> Sheet {
+/// Lee las celdas con valor de una hoja, hasta `max_cells`.
+fn read_sheet(src: &str, ctx: &Ctx, max_cells: usize) -> Sheet {
     let mut sheet = Sheet { cells: Vec::new(), merges: Vec::new(), truncated: false };
     let mut x = Xml::new(src);
     let mut row = 0usize;
@@ -359,11 +396,11 @@ fn read_sheet(src: &str, ctx: &Ctx) -> Sheet {
         let Ev::Start(t) = ev else { continue };
         match local(t.name) {
             "row" => {
-                row = t.attr("r").and_then(|v| v.trim().parse().ok()).unwrap_or(row + 1);
+                row = t.attr("r").and_then(|v| v.trim().parse().ok()).filter(|r| (1..=MAX_ROW).contains(r)).unwrap_or_else(|| (row + 1).min(MAX_ROW));
                 col = 0;
             }
             "c" => {
-                let (c, r) = t.attr("r").and_then(|v| cell_ref(&v)).unwrap_or((col, row.max(1)));
+                let (c, r) = t.attr("r").and_then(|v| cell_ref(&v)).unwrap_or((col.min(MAX_COL - 1), row.max(1)));
                 row = r;
                 col = c + 1;
                 if t.empty {
@@ -388,7 +425,7 @@ fn read_sheet(src: &str, ctx: &Ctx) -> Sheet {
                 if value.trim().is_empty() {
                     continue;
                 }
-                if sheet.cells.len() >= MAX_CELLS {
+                if sheet.cells.len() >= max_cells {
                     sheet.truncated = true;
                     break;
                 }
@@ -407,9 +444,78 @@ fn read_sheet(src: &str, ctx: &Ctx) -> Sheet {
     sheet
 }
 
+/// Hoja muy dispersa: una tabla de dos columnas, referencia y valor, en el orden de la hoja.
+fn sparse_table(cells: Vec<(usize, usize, String)>, page: u32) -> Block {
+    let cell = |text: String| Cell { text, colspan: 1, rowspan: 1, merged: false, images: Vec::new() };
+    let rows = cells.into_iter().map(|(r, c, v)| vec![cell(format!("{}{}", col_name(c), r)), cell(v)]).collect();
+    Block { kind: Kind::Table, rows, page: Some(page), ..Block::default() }
+}
+
+/// Combinaciones en coordenadas de la tabla (`nr` filas por `nc` columnas). Devuelve `span`
+/// (alto y ancho de la celda inicial de cada combinacion) y `covered` (celda tapada por una
+/// combinacion: su valor es el ancho del marcador que la representa, al inicio de cada fila de
+/// la combinacion, o 0 si no lleva marcador). Excel no admite combinaciones que se solapan: vale
+/// la primera y las demas se descartan. El trabajo total esta acotado por el tamano de la tabla.
+#[allow(clippy::type_complexity)]
+fn place_merges(
+    merges: &[(usize, usize, usize, usize)],
+    rows: &[usize],
+    cols: &[usize],
+    warnings: &mut Vec<String>,
+    name: &str,
+) -> (HashMap<(usize, usize), (u32, u32)>, HashMap<(usize, usize), u32>) {
+    let mut span: HashMap<(usize, usize), (u32, u32)> = HashMap::new();
+    let mut covered: HashMap<(usize, usize), u32> = HashMap::new();
+    let (nr, nc) = (rows.len(), cols.len());
+    if merges.is_empty() || nr == 0 || nc == 0 {
+        return (span, covered);
+    }
+    // Celdas ya tomadas por una combinacion, una por byte (la tabla ya esta acotada a MAX_GRID).
+    let mut taken = vec![false; nr * nc];
+    let mut budget = (nr * nc).saturating_mul(MERGE_WORK).saturating_add(merges.len());
+    for &(r1, c1, r2, c2) in merges {
+        let rs = rows.partition_point(|&r| r < r1)..rows.partition_point(|&r| r <= r2);
+        let cs = cols.partition_point(|&c| c < c1)..cols.partition_point(|&c| c <= c2);
+        let (h, w) = (rs.len(), cs.len());
+        if h * w <= 1 {
+            continue;
+        }
+        // Una combinacion que se solapa con otra ya ubicada se descarta.
+        let mut free = true;
+        'scan: for i in rs.clone() {
+            for j in cs.clone() {
+                if budget == 0 {
+                    warnings.push(format!("Hoja «{}»: hay demasiadas combinaciones de celdas superpuestas; se omitieron las restantes.", name));
+                    return (span, covered);
+                }
+                budget -= 1;
+                if taken[i * nc + j] {
+                    free = false;
+                    break 'scan;
+                }
+            }
+        }
+        if !free {
+            continue;
+        }
+        let top_left = (rs.start, cs.start);
+        span.insert(top_left, (h as u32, w as u32));
+        for i in rs {
+            for j in cs.clone() {
+                taken[i * nc + j] = true;
+                if (i, j) != top_left {
+                    covered.insert((i, j), if j == cs.start { w as u32 } else { 0 });
+                }
+            }
+        }
+    }
+    (span, covered)
+}
+
 /// Arma la tabla de una hoja: solo filas y columnas con algun valor, con las combinaciones.
-/// La memoria es proporcional a la tabla que sale, no al rango de la hoja.
-fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str) -> Option<Block> {
+/// La memoria es proporcional a la tabla que sale, no al rango de la hoja. `grid` es lo que
+/// queda del tope de celdas de tabla del libro y se descuenta lo usado.
+fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str, grid: &mut usize) -> Option<Block> {
     let Sheet { mut cells, merges, .. } = sheet;
     if cells.is_empty() {
         return None;
@@ -423,35 +529,35 @@ fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str) 
     cols.sort_unstable();
     cols.dedup();
     let nc = cols.len();
-    let max_rows = (MAX_GRID / nc).max(1);
+    let dense = rows.len().saturating_mul(nc);
+    if dense > SPARSE_MIN_GRID && dense / SPARSE_RATIO > cells.len() {
+        // Pocas celdas en un rango grande: como tabla serian casi todas vacias.
+        let n = cells.len().min(*grid / 2);
+        if n == 0 {
+            warnings.push(format!("Hoja «{}»: se omitio, porque el libro ya alcanzo el tope de {} celdas de tabla.", name, MAX_GRID));
+            return None;
+        }
+        if n < cells.len() {
+            cells.truncate(n);
+            warnings.push(format!("Hoja «{}»: se leyeron solo las primeras {} celdas, por el tope de celdas de tabla del libro.", name, n));
+        }
+        *grid -= 2 * n;
+        warnings.push(format!("Hoja «{}»: los datos estan muy dispersos; se listan como celda y valor, sin combinaciones.", name));
+        return Some(sparse_table(cells, page));
+    }
+    let max_rows = (*grid).min(MAX_GRID) / nc;
+    if max_rows == 0 {
+        warnings.push(format!("Hoja «{}»: se omitio, porque el libro ya alcanzo el tope de {} celdas de tabla.", name, MAX_GRID));
+        return None;
+    }
     if rows.len() > max_rows {
         rows.truncate(max_rows);
         let last = rows[max_rows - 1];
         cells.retain(|c| c.0 <= last);
         warnings.push(format!("Hoja «{}»: se leyeron solo las primeras {} filas con datos ({} columnas).", name, max_rows, nc));
     }
-    // Combinaciones en coordenadas de la tabla. `covered`: celda tapada por una combinacion;
-    // su valor es el ancho del marcador que la representa (al inicio de cada fila de la
-    // combinacion) o 0 si no lleva marcador (a la derecha del inicio).
-    let mut span: HashMap<(usize, usize), (u32, u32)> = HashMap::new();
-    let mut covered: HashMap<(usize, usize), u32> = HashMap::new();
-    for (r1, c1, r2, c2) in merges {
-        let rs = rows.partition_point(|&r| r < r1)..rows.partition_point(|&r| r <= r2);
-        let cs = cols.partition_point(|&c| c < c1)..cols.partition_point(|&c| c <= c2);
-        let (h, w) = (rs.len(), cs.len());
-        let top_left = (rs.start, cs.start);
-        if h * w <= 1 || span.contains_key(&top_left) || covered.contains_key(&top_left) {
-            continue;
-        }
-        span.insert(top_left, (h as u32, w as u32));
-        for i in rs {
-            for j in cs.clone() {
-                if (i, j) != top_left {
-                    covered.insert((i, j), if j == cs.start { w as u32 } else { 0 });
-                }
-            }
-        }
-    }
+    *grid -= rows.len() * nc;
+    let (span, covered) = place_merges(&merges, &rows, &cols, warnings, name);
     let mut out = Vec::with_capacity(rows.len());
     let mut values = cells.into_iter().peekable();
     for (i, &r) in rows.iter().enumerate() {
@@ -575,7 +681,22 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
     let mut hidden = 0usize;
     let mut number = 0u32;
     let mut set = ImageSet::default();
+    // Una misma parte referida por varias hojas se lee una vez (vale la primera referencia).
+    let mut seen = std::collections::HashSet::new();
+    let mut repeated = 0usize;
+    let mut cells_left = MAX_CELLS;
+    let mut grid_left = MAX_GRID;
     for (name, path, is_hidden) in &sheets {
+        if let Some(p) = path {
+            if !seen.insert(p.as_str()) {
+                repeated += 1;
+                continue;
+            }
+            if seen.len() > MAX_SHEETS {
+                doc.warnings.push(format!("El libro tiene mas de {} hojas; se leyeron solo las primeras.", MAX_SHEETS));
+                break;
+            }
+        }
         if *is_hidden {
             hidden += 1;
             continue;
@@ -584,14 +705,18 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
         let Some(path) = path else { continue };
         let Some(src) = zip.read_text(path) else { continue };
         // Las hojas de graficos o de macros no tienen celdas, pero pueden tener imagenes.
-        let table = if src.contains("sheetData") {
-            let sheet = read_sheet(&src, &ctx);
-            if sheet.truncated {
-                doc.warnings.push(format!("Hoja «{}»: se leyeron solo las primeras {} celdas con datos.", name, MAX_CELLS));
-            }
-            sheet_table(sheet, number, &mut doc.warnings, name)
-        } else {
+        let table = if !src.contains("sheetData") {
             None
+        } else if cells_left == 0 {
+            doc.warnings.push(format!("Hoja «{}»: se omitio, porque el libro ya alcanzo el tope de {} celdas con datos.", name, MAX_CELLS));
+            None
+        } else {
+            let sheet = read_sheet(&src, &ctx, cells_left);
+            cells_left -= sheet.cells.len();
+            if sheet.truncated {
+                doc.warnings.push(format!("Hoja «{}»: se leyo solo una parte, porque el libro alcanzo el tope de {} celdas con datos.", name, MAX_CELLS));
+            }
+            sheet_table(sheet, number, &mut doc.warnings, name, &mut grid_left)
         };
         let pics = sheet_images(&zip, path, number, &mut set);
         if table.is_some() || !pics.is_empty() {
@@ -607,6 +732,9 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
     doc.images = set.list;
     if images {
         extract_images(&zip, &mut doc.images, &set.keys);
+    }
+    if repeated > 0 {
+        doc.warnings.push(format!("Se omitieron {} referencias repetidas a hojas ya leidas.", repeated));
     }
     Ok(doc)
 }
@@ -636,6 +764,42 @@ mod tests {
         assert_eq!(excel_date(1.0, false), "1900-01-01");
         assert_eq!(excel_date(61.0, false), "1900-03-01");
         assert_eq!(excel_date(0.0, true), "1904-01-01");
+        // El 29-02-1900 ficticio de Excel: 59, 60 y 61 son tres dias distintos.
+        assert_eq!(excel_date(59.0, false), "1900-02-28");
+        assert_eq!(excel_date(60.0, false), "1900-02-29");
+        assert_eq!(excel_date(60.5, false), "1900-02-29T12:00:00");
+        // Una hora pura sale sin fecha tambien en el sistema 1904.
+        assert_eq!(excel_date(0.75, true), "18:00:00");
+        assert_eq!(excel_date(1.75, true), "1904-01-02T18:00:00");
+    }
+
+    fn hoja(cells: &[(usize, usize)]) -> Sheet {
+        Sheet { cells: cells.iter().map(|&(r, c)| (r, c, format!("{}-{}", r, c))).collect(), merges: Vec::new(), truncated: false }
+    }
+
+    #[test]
+    fn tope_de_tabla_por_libro() {
+        // Dos hojas densas de 10 x 10 con un tope de 150 celdas: la segunda se corta.
+        let cuadro: Vec<(usize, usize)> = (1..=10).flat_map(|r| (0..10).map(move |c| (r, c))).collect();
+        let mut avisos = Vec::new();
+        let mut tope = 150;
+        let a = sheet_table(hoja(&cuadro), 1, &mut avisos, "A", &mut tope).unwrap();
+        assert_eq!((a.rows.len(), tope), (10, 50));
+        let b = sheet_table(hoja(&cuadro), 2, &mut avisos, "B", &mut tope).unwrap();
+        assert_eq!((b.rows.len(), tope), (5, 0));
+        assert!(sheet_table(hoja(&cuadro), 3, &mut avisos, "C", &mut tope).is_none());
+        assert_eq!(avisos.len(), 2, "{:?}", avisos);
+    }
+
+    #[test]
+    fn nombres_de_columnas() {
+        assert_eq!(col_name(0), "A");
+        assert_eq!(col_name(25), "Z");
+        assert_eq!(col_name(26), "AA");
+        assert_eq!(col_name(27), "AB");
+        assert_eq!(col_name(16_383), "XFD");
+        assert_eq!(cell_ref("XFE1"), None);
+        assert_eq!(cell_ref("A1048577"), None);
     }
 
     #[test]

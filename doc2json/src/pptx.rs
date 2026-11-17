@@ -8,16 +8,32 @@
 //! - las tablas, con sus celdas combinadas, y las imagenes con su texto alternativo.
 //!
 //! Cada bloque lleva en `page` el numero de su diapositiva. Las notas del orador van aparte, en
-//! `notes`, con el numero de la diapositiva en `label`. Las diapositivas ocultas se omiten.
+//! `notes`, con el numero de la diapositiva en `label`. Las diapositivas ocultas se omiten, y una
+//! diapositiva referida varias veces se lee una vez.
 //! No se lee el texto de graficos ni de SmartArt.
 
 use crate::doc::*;
 use crate::docx::{extract_images, letters, part_rels, properties, relationships, resolve, roman};
 use crate::image::{format_from_name, ImageSet};
-use crate::symbols::{classify, translate_str, SymbolFont};
+use crate::symbols::{classify, translate, translate_str, SymbolFont};
 use crate::xml::{Ev, Tag, Xml};
 use crate::zipread::ZipArchive;
 use std::collections::HashMap;
+
+/// Tope de diapositivas distintas que se leen.
+const MAX_SLIDES: usize = 10_000;
+
+/// Texto de un tramo segun sus fuentes: con `a:latin` en una fuente de simbolos se dibuja todo
+/// con ella; con `a:sym` solo los caracteres de simbolo (area privada U+F020..U+F0FF).
+fn run_text(latin: SymbolFont, sym: SymbolFont, s: &str) -> String {
+    if latin != SymbolFont::None {
+        translate_str(latin, s)
+    } else if sym != SymbolFont::None {
+        s.chars().map(|c| if (0xF020..=0xF0FF).contains(&(c as u32)) { translate(sym, c) } else { c }).collect()
+    } else {
+        translate_str(SymbolFont::None, s)
+    }
+}
 
 /// Un elemento de la diapositiva con su posicion, para ordenarlos como se leen.
 struct Item {
@@ -94,7 +110,8 @@ fn paragraph(x: &mut Xml, rels: &HashMap<String, String>) -> Para {
     let mut bu_font = SymbolFont::None;
     let mut cur = Run::default();
     let mut in_t = false;
-    let mut font = SymbolFont::None;
+    // Fuente del tramo (`a:latin`) y de sus caracteres de simbolo (`a:sym`).
+    let (mut latin, mut sym) = (SymbolFont::None, SymbolFont::None);
     while let Some(ev) = x.next() {
         match ev {
             Ev::Start(t) => match t.name {
@@ -105,29 +122,34 @@ fn paragraph(x: &mut Xml, rels: &HashMap<String, String>) -> Para {
                 "a:buFont" => bu_font = classify(&t.attr("typeface").unwrap_or_default()),
                 "a:buChar" => p.bullet = Some(translate_str(bu_font, &t.attr("char").unwrap_or_default())),
                 "a:buAutoNum" => {
-                    let start = t.attr("startAt").and_then(|v| v.parse().ok()).unwrap_or(1);
+                    // PowerPoint admite inicios de 1 a 32767.
+                    let start = t.attr("startAt").and_then(|v| v.parse::<i64>().ok()).unwrap_or(1).clamp(1, 32_767);
                     p.auto = Some((t.attr("type").unwrap_or_else(|| "arabicPeriod".into()), start));
                 }
-                "a:r" | "a:fld" => cur = Run::default(),
+                "a:r" | "a:fld" => {
+                    cur = Run::default();
+                    latin = SymbolFont::None;
+                    sym = SymbolFont::None;
+                }
                 "a:rPr" => {
                     cur.bold = t.attr("b").is_some_and(|v| v == "1" || v == "true");
                     cur.italic = t.attr("i").is_some_and(|v| v == "1" || v == "true");
                     cur.underline = t.attr("u").is_some_and(|v| v != "none");
                     cur.strike = t.attr("strike").is_some_and(|v| v != "noStrike");
-                    font = SymbolFont::None;
                 }
-                "a:sym" => font = classify(&t.attr("typeface").unwrap_or_default()),
+                "a:latin" => latin = classify(&t.attr("typeface").unwrap_or_default()),
+                "a:sym" => sym = classify(&t.attr("typeface").unwrap_or_default()),
                 "a:hlinkClick" => cur.link = t.attr("r:id").and_then(|id| rels.get(&id).cloned()),
                 "a:t" if !t.empty => in_t = true,
                 "a:br" => {
                     p.text.push('\n');
                     p.runs.push(Run { text: "\n".into(), ..Run::default() });
                 }
-                "a:endParaRPr" | "a:latin" | "a:ea" | "a:cs" | "a:solidFill" => {}
+                "a:endParaRPr" | "a:ea" | "a:cs" | "a:solidFill" => {}
                 _ => {}
             },
             Ev::Text(s) if in_t => {
-                let s = translate_str(font, &s);
+                let s = run_text(latin, sym, &s);
                 p.text.push_str(&s);
                 cur.text.push_str(&s);
             }
@@ -179,7 +201,7 @@ fn text_body(x: &mut Xml, end: &str, role: Role, rels: &HashMap<String, String>,
                                     *c = Some((kind.clone(), *start - 1));
                                 }
                                 if let Some(c) = c {
-                                    c.1 += 1;
+                                    c.1 = c.1.saturating_add(1);
                                     b.marker = Some(auto_number(kind, c.1));
                                 }
                                 b.ordered = true;
@@ -436,6 +458,17 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
 
     let mut doc = Document { kind: "pptx", ..Document::default() };
     properties(&zip, &mut doc);
+    // Una diapositiva referida varias veces se lee una vez, en su primera posicion.
+    let total = order.len();
+    let mut seen = std::collections::HashSet::new();
+    order.retain(|p| seen.insert(p.clone()));
+    if order.len() < total {
+        doc.warnings.push(format!("Se omitieron {} referencias repetidas a diapositivas ya leidas.", total - order.len()));
+    }
+    if order.len() > MAX_SLIDES {
+        order.truncate(MAX_SLIDES);
+        doc.warnings.push(format!("La presentacion tiene mas de {} diapositivas; se leyeron solo las primeras.", MAX_SLIDES));
+    }
     doc.page_count = Some(order.len());
     let mut notes_list = Vec::new();
     let mut hidden = 0usize;
@@ -477,5 +510,6 @@ mod tests {
         assert_eq!(auto_number("alphaLcParenBoth", 1), "(a)");
         assert_eq!(auto_number("romanUcPeriod", 4), "IV.");
         assert_eq!(auto_number("alphaUcPeriod", 27), "AA.");
+        assert_eq!(auto_number("alphaLcPeriod", 32_767), "32767.");
     }
 }

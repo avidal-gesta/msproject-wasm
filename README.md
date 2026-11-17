@@ -173,13 +173,16 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 - El título sale como `heading`; el texto de los marcadores de contenido, como `list_item` con su nivel y su viñeta o numeración automática (`1.`, `a)`, `IV.`); los cuadros de texto, como párrafos.
 - Tablas con celdas combinadas, imágenes con su texto alternativo y notas del orador aparte, en `notes`.
 - Se omite lo que no es contenido (número de diapositiva, fecha y pie) y las diapositivas ocultas, con un aviso en `warnings`.
+- Una diapositiva referida varias veces en la presentación se lee una vez; se leen hasta 10.000 diapositivas distintas.
 
 ### Excel (.xlsx)
 
 - Cada hoja visible sale como un `heading` con su nombre y una `table` con los valores **como los muestra Excel**: fechas y horas en ISO 8601 (también en libros con sistema de fechas 1904), porcentajes con `%`, tiempos transcurridos (`[h]:mm`) en horas totales, `TRUE`/`FALSE` y errores (`#N/A`) tal cual.
 - Números sin ruido de coma flotante: `0.30000000000000004` sale `0.3`.
 - De las fórmulas se toma el último valor que calculó Excel; no se recalculan.
-- Se quitan las filas y columnas vacías, también las intermedias; las celdas combinadas pasan a `colspan`/`rowspan`.
+- Se quitan las filas y columnas vacías, también las intermedias; las celdas combinadas pasan a `colspan`/`rowspan`. Si dos combinaciones se solapan (Excel no lo permite), vale la primera.
+- Una hoja muy dispersa (más de 16 celdas de tabla por cada valor, como datos en diagonal) sale como una `table` de dos columnas, referencia y valor (`B2`, `123`), con un aviso: como tabla tendría filas × columnas celdas casi todas vacías.
+- Topes para todo el libro, no por hoja: 2 millones de celdas con valor y 4 millones de celdas de tabla. Lo que pasa del tope se corta con un aviso. Una hoja referida varias veces se lee una vez.
 - Se omiten las hojas ocultas, con un aviso en `warnings`.
 
 ### Imágenes

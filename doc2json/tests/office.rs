@@ -356,3 +356,186 @@ fn zip_que_no_es_office_sigue_siendo_error_de_word() {
     assert_eq!(detect(&bytes).unwrap(), Format::Docx);
     assert!(read(&bytes).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Archivos hostiles o raros: topes globales, referencias repetidas, archivos truncados.
+// ---------------------------------------------------------------------------------------------
+
+/// Libro de una hoja con el XML de `sheetData` y `mergeCells` dado.
+fn libro_con_hoja(hoja: &str) -> Vec<u8> {
+    let libro = format!(r#"<?xml version="1.0"?><workbook xmlns:r="{}"><sheets><sheet name="H" sheetId="1" r:id="rId1"/></sheets></workbook>"#, REL);
+    zip(&[
+        ("_rels/.rels", &rels(&[("rId1", "officeDocument", "xl/workbook.xml")])),
+        ("xl/workbook.xml", &libro),
+        ("xl/_rels/workbook.xml.rels", &rels(&[("rId1", "worksheet", "worksheets/sheet1.xml")])),
+        ("xl/worksheets/sheet1.xml", &format!("<worksheet>{}</worksheet>", hoja)),
+    ])
+}
+
+/// Letras de columna de Excel (1 = A).
+fn columna(mut n: usize) -> String {
+    let mut s = String::new();
+    while n > 0 {
+        s.insert(0, (b'A' + ((n - 1) % 26) as u8) as char);
+        n = (n - 1) / 26;
+    }
+    s
+}
+
+fn celdas_de_tablas(d: &Document) -> usize {
+    d.content.iter().filter(|b| b.kind == Kind::Table).map(|b| b.rows.iter().map(Vec::len).sum::<usize>()).sum()
+}
+
+#[test]
+fn excel_hoja_rala_no_se_vuelve_densa() {
+    // 2.000 celdas en diagonal: como tabla densa serian 4 millones de celdas.
+    let mut filas = String::new();
+    for i in 1..=2000usize {
+        filas.push_str(&format!(r#"<row r="{0}"><c r="{1}{0}" t="inlineStr"><is><t>v{0}</t></is></c></row>"#, i, columna(i)));
+    }
+    let d = read(&libro_con_hoja(&format!("<sheetData>{}</sheetData>", filas))).unwrap();
+    let total = celdas_de_tablas(&d);
+    assert!(total <= 2 * 2000 + 2, "celdas materializadas: {}", total);
+    // Ningun valor se pierde: salen como celda y valor.
+    let fila = &d.content[1].rows[1];
+    assert_eq!((fila[0].text.as_str(), fila[1].text.as_str()), ("B2", "v2"));
+    assert_eq!(d.content[1].rows[1999][1].text, "v2000");
+    assert!(d.warnings.iter().any(|w| w.contains("dispers")), "{:?}", d.warnings);
+}
+
+#[test]
+fn excel_combinaciones_solapadas_no_explotan() {
+    // Tabla densa de 1000 x 1000 (las primeras 70 filas llenas y la columna A) y 1000
+    // combinaciones solapadas A{k}:ALL1000, de abajo hacia arriba: sin tope serian ~5 * 10^8
+    // inserciones.
+    let mut filas = String::new();
+    for r in 1..=1000usize {
+        filas.push_str(&format!(r#"<row r="{}">"#, r));
+        let ancho = if r <= 70 { 1000 } else { 1 };
+        for c in 1..=ancho {
+            filas.push_str(&format!(r#"<c r="{}{}"><v>{}</v></c>"#, columna(c), r, c));
+        }
+        filas.push_str("</row>");
+    }
+    let mut comb = String::new();
+    for k in (1..=1000usize).rev() {
+        comb.push_str(&format!(r#"<mergeCell ref="A{}:ALL1000"/>"#, k));
+    }
+    let inicio = std::time::Instant::now();
+    let d = read(&libro_con_hoja(&format!("<sheetData>{}</sheetData><mergeCells>{}</mergeCells>", filas, comb))).unwrap();
+    assert!(inicio.elapsed().as_secs() < 20, "tardo {:?}", inicio.elapsed());
+    // Excel no admite combinaciones solapadas: vale la primera (A1000:ALL1000, una fila).
+    let tabla = d.content.iter().find(|b| b.kind == Kind::Table).unwrap();
+    assert_eq!((tabla.rows[999][0].colspan, tabla.rows[999][0].rowspan), (1000, 1));
+    assert_eq!(tabla.rows[998][0].colspan, 1);
+}
+
+#[test]
+fn excel_hojas_repetidas_se_leen_una_vez() {
+    let mut hojas = String::new();
+    for i in 0..5000 {
+        hojas.push_str(&format!(r#"<sheet name="H{}" sheetId="{}" r:id="rId1"/>"#, i, i + 1));
+    }
+    let libro = format!(r#"<?xml version="1.0"?><workbook xmlns:r="{}"><sheets>{}</sheets></workbook>"#, REL, hojas);
+    let bytes = zip(&[
+        ("_rels/.rels", &rels(&[("rId1", "officeDocument", "xl/workbook.xml")])),
+        ("xl/workbook.xml", &libro),
+        ("xl/_rels/workbook.xml.rels", &rels(&[("rId1", "worksheet", "worksheets/sheet1.xml")])),
+        ("xl/worksheets/sheet1.xml", r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>dato</t></is></c></row></sheetData></worksheet>"#),
+    ]);
+    let d = read(&bytes).unwrap();
+    assert_eq!(d.content.iter().filter(|b| b.kind == Kind::Table).count(), 1);
+    assert!(d.warnings.iter().any(|w| w.contains("repetid")), "{:?}", d.warnings);
+}
+
+#[test]
+fn powerpoint_diapositivas_repetidas_se_leen_una_vez() {
+    let mut ids = String::new();
+    for i in 0..10_000 {
+        ids.push_str(&format!(r#"<p:sldId id="{}" r:id="rId1"/>"#, 256 + i));
+    }
+    let bytes = zip(&[
+        ("_rels/.rels", &rels(&[("rId1", "officeDocument", "ppt/presentation.xml")])),
+        ("ppt/presentation.xml", &format!(r#"<?xml version="1.0"?><p:presentation {}><p:sldIdLst>{}</p:sldIdLst></p:presentation>"#, NS, ids)),
+        ("ppt/_rels/presentation.xml.rels", &rels(&[("rId1", "slide", "slides/slide1.xml")])),
+        ("ppt/slides/slide1.xml", &diapositiva(&forma("", 0, 0, "<a:p><a:r><a:t>Unica</a:t></a:r></a:p>"), false)),
+    ]);
+    let d = read(&bytes).unwrap();
+    assert_eq!(textos(&d), vec!["Unica"]);
+    assert_eq!(d.page_count, Some(1));
+    assert!(d.warnings.iter().any(|w| w.contains("repetid")), "{:?}", d.warnings);
+}
+
+/// Presentacion de una diapositiva con las formas dadas.
+fn presentacion_con(formas: &str) -> Vec<u8> {
+    zip(&[
+        ("_rels/.rels", &rels(&[("rId1", "officeDocument", "ppt/presentation.xml")])),
+        ("ppt/presentation.xml", &format!(r#"<?xml version="1.0"?><p:presentation {}><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#, NS)),
+        ("ppt/_rels/presentation.xml.rels", &rels(&[("rId1", "slide", "slides/slide1.xml")])),
+        ("ppt/slides/slide1.xml", &diapositiva(formas, false)),
+    ])
+}
+
+#[test]
+fn powerpoint_numeracion_con_inicio_enorme() {
+    for inicio in ["2000000000", "9223372036854775807", "-9223372036854775808", "0"] {
+        let p = format!(
+            r#"<a:p><a:pPr><a:buAutoNum type="alphaLcPeriod" startAt="{0}"/></a:pPr><a:r><a:t>Uno</a:t></a:r></a:p><a:p><a:pPr><a:buAutoNum type="alphaLcPeriod" startAt="{0}"/></a:pPr><a:r><a:t>Dos</a:t></a:r></a:p>"#,
+            inicio
+        );
+        let d = read(&presentacion_con(&forma("", 0, 0, &p))).unwrap();
+        for b in &d.content {
+            assert!(b.marker.as_deref().unwrap_or("").len() < 40, "inicio {}: {:?}", inicio, b.marker);
+        }
+    }
+}
+
+#[test]
+fn powerpoint_simbolos_solo_en_el_area_privada() {
+    // `a:sym` es la fuente de los caracteres de simbolo (U+F0xx); el resto del tramo es texto.
+    let p = r#"<a:p><a:r><a:rPr><a:sym typeface="Wingdings"/></a:rPr><a:t>Listo &#xF0FC; revisado</a:t></a:r></a:p>"#;
+    let d = read(&presentacion_con(&forma("", 0, 0, p))).unwrap();
+    assert_eq!(textos(&d), vec!["Listo \u{2713} revisado"]);
+    // Con `a:latin` en Wingdings todo el tramo se dibuja con esa fuente.
+    let p = r#"<a:p><a:r><a:rPr><a:latin typeface="Wingdings"/></a:rPr><a:t>&#xFC;</a:t></a:r></a:p>"#;
+    let d = read(&presentacion_con(&forma("", 0, 0, p))).unwrap();
+    assert_eq!(textos(&d), vec!["\u{2713}"]);
+}
+
+#[test]
+fn powerpoint_grupos_muy_anidados() {
+    let n = 50_000;
+    let abre = r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="7" name="g"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>"#.repeat(n);
+    let formas = format!("{}{}{}", abre, forma("", 0, 0, "<a:p><a:r><a:t>Al fondo</a:t></a:r></a:p>"), "</p:grpSp>".repeat(n));
+    let d = read(&presentacion_con(&formas)).unwrap();
+    assert_eq!(textos(&d), vec!["Al fondo"]);
+}
+
+#[test]
+fn parte_principal_declarada_que_no_existe() {
+    // Las relaciones apuntan a una presentacion que no esta, pero el paquete es un Word: antes
+    // de los lectores de Office se leia como Word y debe seguir asi.
+    let documento = r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hola</w:t></w:r></w:p></w:body></w:document>"#;
+    let bytes = zip(&[("_rels/.rels", &rels(&[("rId1", "officeDocument", "ppt/presentation.xml")])), ("word/document.xml", documento)]);
+    assert_eq!(detect(&bytes).unwrap(), Format::Docx);
+    assert_eq!(textos(&read(&bytes).unwrap()), vec!["Hola"]);
+}
+
+#[test]
+fn excel_filas_y_columnas_fuera_de_rango() {
+    let hoja = r#"<sheetData><row r="18446744073709551615"><c r="A18446744073709551615" t="inlineStr"><is><t>x</t></is></c></row><row><c t="inlineStr"><is><t>y</t></is></c></row><row r="4294967295"/><row><c r="ZZZ1" t="inlineStr"><is><t>z</t></is></c></row></sheetData>"#;
+    let d = read(&libro_con_hoja(hoja)).unwrap();
+    let todo: Vec<&str> = d.content.iter().flat_map(|b| b.rows.iter().flatten().map(|c| c.text.as_str())).collect();
+    for v in ["x", "y", "z"] {
+        assert!(todo.contains(&v), "falta {} en {:?}", v, todo);
+    }
+}
+
+#[test]
+fn archivos_truncados_no_hacen_caer_la_lectura() {
+    for bytes in [presentacion(), planilla(false)] {
+        for corte in (0..bytes.len()).step_by(37) {
+            let _ = read(&bytes[..corte]);
+        }
+    }
+}
