@@ -19,14 +19,23 @@ impl Default for Parms {
     }
 }
 
+/// Salida de un filtro que expande los datos, acotada por lo que quede del presupuesto de la
+/// lectura (`budget`) y anotada en el.
+fn budgeted(decode: impl FnOnce(usize) -> Vec<u8>) -> Vec<u8> {
+    let cap = crate::budget::room(MAX_OUTPUT);
+    let out = decode(cap);
+    crate::budget::spend(out.len(), cap < MAX_OUTPUT && out.len() >= cap);
+    out
+}
+
 /// Aplica un filtro. `None` si el filtro no esta soportado.
 pub fn apply(name: &str, data: &[u8], p: &Parms) -> Option<Vec<u8>> {
     match name {
         "FlateDecode" | "Fl" => Some(predict(zlib(data).data, p)),
-        "LZWDecode" | "LZW" => Some(predict(lzw(data, p.early_change != 0, MAX_OUTPUT), p)),
-        "ASCII85Decode" | "A85" => Some(ascii85(data, MAX_OUTPUT)),
+        "LZWDecode" | "LZW" => Some(predict(budgeted(|cap| lzw(data, p.early_change != 0, cap)), p)),
+        "ASCII85Decode" | "A85" => Some(budgeted(|cap| ascii85(data, cap))),
         "ASCIIHexDecode" | "AHx" => Some(ascii_hex(data)),
-        "RunLengthDecode" | "RL" => Some(run_length(data, MAX_OUTPUT)),
+        "RunLengthDecode" | "RL" => Some(budgeted(|cap| run_length(data, cap))),
         // Cifrado "identidad": no cambia los datos.
         "Crypt" => Some(data.to_vec()),
         _ => None,

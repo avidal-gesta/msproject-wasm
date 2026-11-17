@@ -261,7 +261,18 @@ pub fn read_with(bytes: &[u8], tags: bool) -> Result<Document, String> {
     let mut stores: Vec<structure::PageStore> = Vec::with_capacity(pages.len());
     let mut unmarked: Vec<Vec<content::Item>> = Vec::with_capacity(pages.len());
     let mut arts: Vec<Vec<content::Item>> = Vec::with_capacity(pages.len());
+    // Presupuesto de la lectura: paginas y texto. Las paginas que no se leen se informan.
+    let limits = crate::budget::limits();
+    let mut stopped: Option<String> = None;
     for (i, page) in pages.iter().enumerate() {
+        if i >= limits.max_pages {
+            stopped = Some(format!("Se leyeron las primeras {} de {} paginas (limite de paginas).", i, pages.len()));
+            break;
+        }
+        if total_chars > limits.max_chars {
+            stopped = Some(format!("Se leyeron las primeras {} de {} paginas: se alcanzo el limite de {} caracteres de texto.", i, pages.len(), limits.max_chars));
+            break;
+        }
         let data = pdf.page_content(page);
         let mut interp = Interp::new(&pdf, &fonts);
         interp.run(&data, &page.resources, IDENTITY);
@@ -338,7 +349,10 @@ pub fn read_with(bytes: &[u8], tags: bool) -> Result<Document, String> {
     if pdf.rebuilt {
         doc.warnings.push("El indice interno del PDF estaba danado; se reconstruyo recorriendo el archivo.".into());
     }
-    if empty_pages.len() == pages.len() {
+    if let Some(w) = stopped {
+        doc.warnings.push(w);
+    }
+    if !doc.pages.is_empty() && empty_pages.len() == doc.pages.len() {
         doc.warnings.push("Ninguna pagina tiene texto: el PDF parece ser una imagen escaneada. Se necesita OCR para leerlo.".into());
     } else if !empty_pages.is_empty() {
         let list: Vec<String> = empty_pages.iter().take(20).map(|p| p.to_string()).collect();

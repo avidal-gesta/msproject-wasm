@@ -5,10 +5,24 @@
 //!   3. Leer `doc_result_len()` bytes desde `doc_result_ptr()`:
 //!      con estado 0 es el JSON; con estado 1 es el mensaje de error, ambos en UTF-8.
 //!   4. `doc_free(ptr, n)`.
+//!
+//! Opcional, antes de convertir: `doc_set_limits(mb, paginas, caracteres)` fija el presupuesto de
+//! las conversiones siguientes (datos descomprimidos en MB, paginas, caracteres; 0 = por defecto).
 
 use std::alloc::{alloc, dealloc, Layout};
 
 static mut RESULT: Vec<u8> = Vec::new();
+static mut LIMITS: Option<crate::budget::Limits> = None;
+
+/// Fija los limites de las conversiones siguientes. Un 0 deja el valor por defecto de ese limite.
+#[no_mangle]
+pub extern "C" fn doc_set_limits(mb: u32, pages: u32, chars: u32) {
+    let d = crate::budget::Limits::default();
+    let pick = |v: u32, def: usize, unit: usize| if v == 0 { def } else { (v as usize).saturating_mul(unit) };
+    let l = crate::budget::Limits { max_decompressed: pick(mb, d.max_decompressed, 1 << 20), max_pages: pick(pages, d.max_pages, 1), max_chars: pick(chars, d.max_chars, 1) };
+    // WebAssembly aqui es de un solo hilo: no hay acceso concurrente a LIMITS.
+    unsafe { *std::ptr::addr_of_mut!(LIMITS) = Some(l) };
+}
 
 #[no_mangle]
 pub extern "C" fn doc_alloc(len: usize) -> *mut u8 {
@@ -37,11 +51,19 @@ pub unsafe extern "C" fn doc_free(ptr: *mut u8, len: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn doc_convert(ptr: *const u8, len: usize, mode: u32) -> u32 {
     let input: &[u8] = if ptr.is_null() || len == 0 { &[] } else { std::slice::from_raw_parts(ptr, len) };
+    let limits = unsafe { (*std::ptr::addr_of!(LIMITS)).unwrap_or_default() };
     let result = match mode & 0xff {
-        0 => crate::to_json(input, false),
-        1 => crate::to_json(input, true),
-        2 => crate::to_markdown(input),
-        3 => crate::to_chunks_json(input, (mode >> 8) as usize),
+        0..=3 => crate::read_with_limits(input, limits).map(|d| match mode & 0xff {
+            0 | 1 => crate::doc::to_json(&d, mode & 0xff == 1),
+            2 => crate::markdown::to_markdown(&d),
+            _ => {
+                let size = match (mode >> 8) as usize {
+                    0 => crate::markdown::DEFAULT_CHUNK,
+                    n => n,
+                };
+                crate::markdown::chunks_json(&d, &crate::markdown::chunks(&d, size))
+            }
+        }),
         _ => Err("Modo de conversion desconocido.".to_string()),
     };
     let (status, bytes) = match result {

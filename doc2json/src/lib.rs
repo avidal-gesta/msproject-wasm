@@ -10,6 +10,7 @@
 //! std::fs::write("informe.json", json).unwrap();
 //! ```
 
+pub mod budget;
 pub mod doc;
 pub mod docx;
 pub mod inflate;
@@ -48,12 +49,77 @@ pub fn detect(bytes: &[u8]) -> Result<Format, String> {
     Err("Formato no reconocido: se esperaba un .docx o un .pdf.".into())
 }
 
-/// Lee un documento Word o PDF.
+/// Lee un documento Word o PDF con los limites de recursos por defecto (`budget::Limits`).
 pub fn read(bytes: &[u8]) -> Result<Document, String> {
-    match detect(bytes)? {
+    read_with_limits(bytes, budget::Limits::default())
+}
+
+/// Lee un documento Word o PDF sin pasar los limites dados: datos descomprimidos en total,
+/// paginas y caracteres de texto. Al alcanzar uno, entrega lo leido hasta ahi con un aviso en
+/// `warnings`; no falla.
+pub fn read_with_limits(bytes: &[u8], limits: budget::Limits) -> Result<Document, String> {
+    let format = detect(bytes)?;
+    budget::begin(limits);
+    let result = match format {
         Format::Docx => docx::read(bytes),
         Format::Pdf => pdf::read(bytes),
+    };
+    let (_, decompressed_hit) = budget::end();
+    let mut d = result?;
+    if decompressed_hit {
+        d.warnings.push(budget::decompressed_warning(limits.max_decompressed));
     }
+    limit_text(&mut d, limits.max_chars);
+    Ok(d)
+}
+
+/// Deja como maximo `max` caracteres de texto en los bloques (y en las paginas de un PDF).
+fn limit_text(d: &mut Document, max: usize) {
+    let mut total = 0usize;
+    let mut cut = None;
+    for (i, b) in d.content.iter().enumerate() {
+        let n = doc::block_text(b).chars().count();
+        if total + n > max {
+            cut = Some((i, max - total));
+            break;
+        }
+        total += n;
+    }
+    let pages_total: usize = d.pages.iter().map(|p| p.text.chars().count()).sum();
+    if cut.is_none() && pages_total <= max {
+        return;
+    }
+    if let Some((i, left)) = cut {
+        // El bloque que cruza el limite se corta por dentro (el texto, o las filas de una tabla)
+        // y los siguientes se descartan.
+        d.content.truncate(i + 1);
+        let b = &mut d.content[i];
+        if b.kind == doc::Kind::Table {
+            let mut used = 0usize;
+            let keep = b.rows.iter().take_while(|r| {
+                used += r.iter().map(|c| c.text.chars().count() + 1).sum::<usize>();
+                used <= left
+            });
+            let n = keep.count();
+            b.rows.truncate(n);
+        } else {
+            b.text = b.text.chars().take(left).collect();
+            b.runs.clear();
+        }
+        if (b.kind == doc::Kind::Table && b.rows.is_empty()) || (b.kind != doc::Kind::Table && b.text.is_empty()) {
+            d.content.pop();
+        }
+    }
+    let mut left = max;
+    for p in d.pages.iter_mut() {
+        let n = p.text.chars().count();
+        if n > left {
+            p.text = p.text.chars().take(left).collect();
+            p.lines.clear();
+        }
+        left = left.saturating_sub(n);
+    }
+    d.warnings.push(format!("El documento tiene mas texto que el limite de {} caracteres: se entrega solo la primera parte.", max));
 }
 
 /// Convierte un documento a JSON. Con `full` se incluyen estilos, formato de los tramos de

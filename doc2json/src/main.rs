@@ -1,5 +1,5 @@
 //! Linea de comandos:
-//! `doc2json <archivo.docx|archivo.pdf> [salida] [--full | --markdown | --fragmentos[=N]]`
+//! `doc2json <archivo.docx|archivo.pdf> [salida] [--full | --markdown | --fragmentos[=N]] [--max-mb=N] [--max-paginas=N] [--max-caracteres=N]`
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,7 +16,22 @@ fn main() -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut full = false;
     let mut salida = Salida::Json;
+    let mut limits = doc2json::budget::Limits::default();
     for a in std::env::args().skip(1) {
+        // Limites de recursos: --max-mb, --max-paginas, --max-caracteres (enteros positivos).
+        if let Some((flag, value)) = a.split_once('=').filter(|(f, _)| f.starts_with("--max-")) {
+            let n = match value.parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => return usage(),
+            };
+            match flag {
+                "--max-mb" => limits.max_decompressed = n.saturating_mul(1 << 20),
+                "--max-paginas" => limits.max_pages = n,
+                "--max-caracteres" => limits.max_chars = n,
+                _ => return usage(),
+            }
+            continue;
+        }
         match a.as_str() {
             "--full" => full = true,
             "--markdown" | "--md" => salida = Salida::Markdown,
@@ -39,7 +54,7 @@ fn main() -> ExitCode {
         Ok(b) => b,
         Err(e) => return fail(&format!("No se pudo leer {}: {}", input.display(), e)),
     };
-    let doc = match doc2json::read(&bytes) {
+    let doc = match doc2json::read_with_limits(&bytes, limits) {
         Ok(d) => d,
         Err(e) => return fail(&e),
     };
@@ -68,10 +83,14 @@ fn say(msg: &str) {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("Uso: doc2json <archivo.docx|archivo.pdf> [salida] [--full | --markdown | --fragmentos[=N]]");
-    eprintln!("  --full           JSON con estilos, formato y lineas de cada pagina");
-    eprintln!("  --markdown       Markdown (tablas GFM, notas al pie, marcas de pagina en PDF)");
-    eprintln!("  --fragmentos=N   fragmentos de hasta N caracteres por seccion, en JSON (por defecto 2000)");
+    eprintln!("Uso: doc2json <archivo.docx|archivo.pdf> [salida] [--full | --markdown | --fragmentos[=N]] [--max-mb=N] [--max-paginas=N] [--max-caracteres=N]");
+    eprintln!("  --full              JSON con estilos, formato y lineas de cada pagina");
+    eprintln!("  --markdown          Markdown (tablas GFM, notas al pie, marcas de pagina en PDF)");
+    eprintln!("  --fragmentos=N      fragmentos de hasta N caracteres por seccion, en JSON (por defecto 2000)");
+    eprintln!("  --max-mb=N          datos descomprimidos en total, en MB (por defecto 128)");
+    eprintln!("  --max-paginas=N     paginas de PDF que se leen (por defecto 20000)");
+    eprintln!("  --max-caracteres=N  caracteres de texto (por defecto 50000000)");
+    eprintln!("  Al alcanzar un limite se entrega lo leido hasta ahi, con un aviso.");
     ExitCode::from(2)
 }
 

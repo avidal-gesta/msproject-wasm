@@ -222,6 +222,23 @@ Dos advertencias sobre esta variante:
 
 Si la web define una política de seguridad de contenido (CSP) estricta, `script-src` debe incluir `'wasm-unsafe-eval'`.
 
+### Límites de recursos
+
+Cada lectura tiene un presupuesto: cuánto se puede descomprimir en total (todas las partes del `.docx` o todos los flujos del PDF), cuántas páginas de PDF se leen y cuánto texto se junta. Protege contra archivos hechos para agotar la memoria (un `.docx` de 1,5 MB puede descomprimir 250 MB) y permite acotar el costo de cada documento. Al alcanzar un límite **no se rechaza el archivo**: se entrega lo leído hasta ahí, con un aviso en `warnings`.
+
+| Límite | Por defecto | Web (`limits`) | Consola |
+|---|---|---|---|
+| Datos descomprimidos en total | 128 MB | `maxDecompressedMB` | `--max-mb=N` |
+| Páginas de PDF | 20 000 | `maxPages` | `--max-paginas=N` |
+| Caracteres de texto | 50 000 000 | `maxChars` | `--max-caracteres=N` |
+
+```ts
+// En una función con poca memoria (p. ej. 256 MB), conviene bajarlos:
+const doc = await docToJson(bytes, { limits: { maxDecompressedMB: 32, maxPages: 500 } });
+```
+
+Los valores por defecto son holgados: en 900 documentos de oficina reales el máximo fue 40 MB descomprimidos (mediana 0,7 MB), 572 páginas y 2,5 millones de caracteres, y con ellos la salida es idéntica byte a byte a la de una lectura sin límites. Con un `.docx` de 1,5 MB que descomprime 250 MB, la memoria máxima del proceso pasa de 2,9 GB (sin presupuesto) a 875 MB por defecto y a 464 MB con `maxDecompressedMB: 32`. En Rust: `doc2json::read_with_limits(bytes, Limits { … })`.
+
 ### Guardar documentos en Supabase
 
 ```sql
@@ -423,6 +440,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 
 - 1.500 PDF (6.127 páginas) y 400 Word reales: ningún fallo ni cuelgue; 51 ms por archivo en promedio.
 - 460 archivos dañados a propósito (truncados, con bytes alterados, con tramos borrados): todos terminan en lectura parcial o en un error claro.
+- Archivos "bomba" armados en `doc2json/tests/presupuesto.rs` (un `.docx` de ~250 KB que descomprime 40 MB, un PDF con un flujo que descomprime 30 MB, un PDF de 50 páginas): se cortan en el límite pedido con su aviso, sin afectar a la lectura siguiente.
 - En todas las herramientas, el archivo generado en el navegador es idéntico byte a byte al del ejecutable.
 
 Los scripts de comparación y los archivos con que se hizo esta validación no forman parte de este repositorio.
@@ -437,6 +455,7 @@ src/                    mpp2xlsx
   xlsx.rs  zip.rs       escritor de Excel y compresor
   json.rs  wasm.rs  main.rs
 doc2json/src/           doc2json
+  budget.rs             presupuesto de recursos de cada lectura (descompresión, páginas, texto)
   inflate.rs            descompresor DEFLATE / zlib
   zipread.rs  xml.rs    lector ZIP y lector XML
   docx.rs               lector de Word: estilos, numeración, tablas, notas
@@ -455,6 +474,7 @@ doc2json/src/           doc2json
   symbols.rs            fuentes Symbol y Wingdings a Unicode
 doc2json/tests/
   ejemplo.rs            pruebas de punta a punta con los archivos de ejemplo/
+  presupuesto.rs        archivos "bomba" armados en la prueba y los límites de recursos
 web/
   mpp2xlsx.js  .d.ts  .wasm     módulo de Project
   doc2json.js  .d.ts  .wasm     módulo de documentos

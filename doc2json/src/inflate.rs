@@ -97,7 +97,7 @@ const DIST_BASE: [u16; 30] = [
 const DIST_EXTRA: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 const CLEN_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
-fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> Option<()> {
+fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, cap: usize) -> Option<()> {
     loop {
         let sym = lit.decode(b)? as usize;
         if sym < 256 {
@@ -115,7 +115,7 @@ fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> Opti
                 return None;
             }
             let distance = DIST_BASE[d] as usize + b.bits(DIST_EXTRA[d] as u32)? as usize;
-            if distance > out.len() || out.len() + len > MAX_OUTPUT {
+            if distance > out.len() || out.len() + len > cap {
                 return None;
             }
             let start = out.len() - distance;
@@ -124,13 +124,13 @@ fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> Opti
                 out.push(v);
             }
         }
-        if out.len() > MAX_OUTPUT {
+        if out.len() > cap {
             return None;
         }
     }
 }
 
-fn run(b: &mut Bits, out: &mut Vec<u8>) -> Option<()> {
+fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize) -> Option<()> {
     loop {
         let last = b.bits(1)?;
         match b.bits(2)? {
@@ -139,7 +139,7 @@ fn run(b: &mut Bits, out: &mut Vec<u8>) -> Option<()> {
                 let len = *b.d.get(b.pos)? as usize | (*b.d.get(b.pos + 1)? as usize) << 8;
                 b.pos += 4;
                 let chunk = b.d.get(b.pos..b.pos + len)?;
-                if out.len() + len > MAX_OUTPUT {
+                if out.len() + len > cap {
                     return None;
                 }
                 out.extend_from_slice(chunk);
@@ -149,7 +149,7 @@ fn run(b: &mut Bits, out: &mut Vec<u8>) -> Option<()> {
                 let mut l = [8u8; 288];
                 l[144..256].fill(9);
                 l[256..280].fill(7);
-                block(b, out, &Huffman::new(&l), &Huffman::new(&[5u8; 30]))?;
+                block(b, out, &Huffman::new(&l), &Huffman::new(&[5u8; 30]), cap)?;
             }
             2 => {
                 let nlit = b.bits(5)? as usize + 257;
@@ -184,7 +184,7 @@ fn run(b: &mut Bits, out: &mut Vec<u8>) -> Option<()> {
                     lengths[i..i + repeat].fill(value);
                     i += repeat;
                 }
-                block(b, out, &Huffman::new(&lengths[..nlit]), &Huffman::new(&lengths[nlit..]))?;
+                block(b, out, &Huffman::new(&lengths[..nlit]), &Huffman::new(&lengths[nlit..]), cap)?;
             }
             _ => return None,
         }
@@ -194,11 +194,15 @@ fn run(b: &mut Bits, out: &mut Vec<u8>) -> Option<()> {
     }
 }
 
-/// Descomprime un flujo DEFLATE "crudo" (el de las entradas de un ZIP).
+/// Descomprime un flujo DEFLATE "crudo" (el de las entradas de un ZIP). La salida se corta en
+/// `MAX_OUTPUT` o en lo que quede del presupuesto de la lectura en curso (`budget`), lo que sea menor.
 pub fn inflate(d: &[u8]) -> Inflated {
-    let mut out = Vec::with_capacity(d.len().saturating_mul(3).min(MAX_OUTPUT));
+    let cap = crate::budget::room(MAX_OUTPUT);
+    let mut out = Vec::with_capacity(d.len().saturating_mul(3).min(cap));
     let mut b = Bits { d, pos: 0, acc: 0, n: 0 };
-    let ok = run(&mut b, &mut out).is_some();
+    let ok = run(&mut b, &mut out, cap).is_some();
+    // Se corto por el presupuesto (no por un tope fijo ni por datos danados): se avisa.
+    crate::budget::spend(out.len(), !ok && cap < MAX_OUTPUT && out.len() + 258 >= cap);
     Inflated { data: out, ok }
 }
 

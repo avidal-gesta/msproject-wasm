@@ -4,9 +4,24 @@ export type WasmSource = string | URL | Response | Promise<Response> | BufferSou
 /** Archivo de entrada: sus bytes o directamente el `File` de un `<input type="file">`. */
 export type FileInput = Uint8Array | ArrayBuffer | Blob;
 
+/**
+ * Presupuesto de recursos de una conversion. Al alcanzar un limite, el documento se entrega leido
+ * hasta ahi con un aviso en `warnings` (no se rechaza). Los que se omiten quedan por defecto.
+ */
+export interface Limits {
+  /** Datos descomprimidos en total, en MB (todas las partes y flujos del archivo). Por defecto 128. */
+  maxDecompressedMB?: number;
+  /** Paginas de PDF que se leen. Por defecto 20000. */
+  maxPages?: number;
+  /** Caracteres de texto. Por defecto 50 000 000. */
+  maxChars?: number;
+}
+
 export interface JsonOptions {
   /** Agrega estilo y alineacion de cada bloque, los tramos con formato y, en PDF, las lineas de cada pagina. */
   full?: boolean;
+  /** Limites de recursos de esta conversion (por ejemplo, mas bajos en una funcion con poca memoria). */
+  limits?: Limits;
 }
 
 /** Descarga y compila el modulo. Llamarla varias veces no lo descarga de nuevo. */
@@ -23,11 +38,13 @@ export declare function docToJson(file: FileInput, options?: JsonOptions): Promi
  * notas al pie como `[^1]` y, en Word, negrita, cursiva y enlaces. En PDF cada pagina empieza con
  * `<!-- pagina N -->`.
  */
-export declare function docToMarkdown(file: FileInput): Promise<string>;
+export declare function docToMarkdown(file: FileInput, options?: { limits?: Limits }): Promise<string>;
 
 export interface ChunkOptions {
   /** Tamano maximo de cada fragmento, en caracteres. Por defecto 2000 (unos 500 tokens en castellano); minimo 200. */
   maxChars?: number;
+  /** Limites de recursos de la lectura, como en `docToJson`. */
+  limits?: Limits;
 }
 
 export interface DocChunk {
