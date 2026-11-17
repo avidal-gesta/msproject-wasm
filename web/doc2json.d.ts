@@ -27,14 +27,14 @@ export interface JsonOptions {
 /** Descarga y compila el modulo. Llamarla varias veces no lo descarga de nuevo. */
 export declare function init(source: WasmSource): Promise<void>;
 
-/** Convierte un .docx o un .pdf en JSON, como texto. Rechaza con `Error` si el archivo no se puede leer. */
+/** Convierte un .docx, .pdf, .pptx o .xlsx en JSON, como texto. Rechaza con `Error` si el archivo no se puede leer. */
 export declare function docToJsonText(file: FileInput, options?: JsonOptions): Promise<string>;
 
-/** Convierte un .docx o un .pdf en un objeto con metadatos, bloques de contenido y texto plano. */
+/** Convierte un .docx, .pdf, .pptx o .xlsx en un objeto con metadatos, bloques de contenido y texto plano. */
 export declare function docToJson(file: FileInput, options?: JsonOptions): Promise<DocDocument>;
 
 /**
- * Convierte un .docx o un .pdf en Markdown: titulos con `#`, listas con su numeracion, tablas GFM,
+ * Convierte un documento (Word, PDF, PowerPoint o Excel) en Markdown: titulos con `#`, listas con su numeracion, tablas GFM,
  * notas al pie como `[^1]` y, en Word, negrita, cursiva y enlaces. En PDF cada pagina empieza con
  * `<!-- pagina N -->`.
  */
@@ -66,7 +66,7 @@ export interface DocChunks {
 }
 
 /**
- * Corta un .docx o un .pdf en fragmentos para indexar o enviar a un modelo: cada uno empieza en un
+ * Corta un documento (Word, PDF, PowerPoint o Excel) en fragmentos para indexar o enviar a un modelo: cada uno empieza en un
  * titulo cuando se puede, nunca corta un bloque (salvo uno mas grande que el fragmento) y las tablas
  * largas se parten por filas repitiendo el encabezado.
  */
@@ -125,7 +125,7 @@ export interface DocBlock {
   ordered?: boolean;
   /** Numeracion o vineta visible: "1.1", "a)", "•". */
   marker?: string;
-  /** Notas y comentarios: su numero o su autor. */
+  /** Notas y comentarios: su numero o su autor. Notas del orador: numero de la diapositiva. */
   label?: string;
   /** Todos los bloques menos tablas, imagenes y saltos de pagina. */
   text?: string;
@@ -134,7 +134,7 @@ export interface DocBlock {
   /** Imagenes: nombre del archivo incrustado y texto alternativo. */
   name?: string;
   alt?: string;
-  /** Solo PDF. */
+  /** PDF: pagina. PowerPoint: diapositiva. Excel: numero de hoja. */
   page?: number;
   /** Solo con `full`. */
   style?: string;
@@ -169,7 +169,7 @@ export interface DocOutlineItem {
 }
 
 export interface DocDocument {
-  type: 'docx' | 'pdf';
+  type: 'docx' | 'pdf' | 'pptx' | 'xlsx';
   metadata: DocMetadata;
   page_count: number | null;
   stats: DocStats;
@@ -187,6 +187,8 @@ export interface DocDocument {
   /** Solo Word, cuando existen. */
   endnotes?: DocBlock[];
   comments?: DocBlock[];
+  /** Solo PowerPoint: notas del orador. */
+  notes?: DocBlock[];
   /** Avisos: paginas escaneadas sin texto, indice reconstruido, fuentes ilegibles. */
   warnings?: string[];
   /** Todo el texto plano. */

@@ -2,7 +2,9 @@
 //!
 //! - `to_markdown` arma Markdown (con tablas GFM) desde los bloques: titulos con `#`, listas con
 //!   su numeracion o vineta, tablas con sus celdas combinadas, notas al pie como `[^1]`, y en Word
-//!   negrita, cursiva y enlaces. En PDF marca el inicio de cada pagina con `<!-- pagina N -->`.
+//!   negrita, cursiva y enlaces. Marca el inicio de cada pagina de PDF (`<!-- pagina N -->`),
+//!   diapositiva de PowerPoint (`<!-- diapositiva N -->`, con sus notas del orador como cita) u
+//!   hoja de Excel (`<!-- hoja N -->`).
 //! - `chunks` corta ese Markdown en fragmentos de un tamano maximo para indexar o enviar a un
 //!   modelo: cada fragmento empieza en un titulo cuando se puede, nunca corta un bloque (salvo que
 //!   el bloque solo ya sea mas grande que el fragmento) y trae la ruta de titulos de su seccion y
@@ -293,22 +295,46 @@ pub fn to_markdown(d: &Document) -> String {
     let mut out = String::new();
     let mut prev: Option<Kind> = None;
     let mut page: Option<u32> = None;
-    let pdf = d.kind == "pdf";
+    // Marca al comenzar cada pagina de PDF, diapositiva de PowerPoint u hoja de Excel.
+    let marker = match d.kind {
+        "pdf" => Some("pagina"),
+        "pptx" => Some("diapositiva"),
+        "xlsx" => Some("hoja"),
+        _ => None,
+    };
+    // Notas del orador de PowerPoint: van como cita al final de su diapositiva.
+    let speaker: Vec<(u32, String)> = d
+        .extras
+        .iter()
+        .filter(|(k, _)| *k == "notes")
+        .flat_map(|(_, list)| list.iter())
+        .filter_map(|b| Some((b.label.as_deref()?.parse().ok()?, b.text.trim().to_string())))
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+    let flush_notes = |out: &mut String, prev: &mut Option<Kind>, slide: Option<u32>| {
+        for (_, t) in speaker.iter().filter(|(n, _)| Some(*n) == slide) {
+            out.push_str("\n\n> **Notas del orador:** ");
+            out.push_str(&t.replace('\n', "\n> "));
+            *prev = Some(Kind::Paragraph);
+        }
+    };
     for b in &d.content {
         let md = block_md(b, &cx);
         if md.trim().is_empty() {
             continue;
         }
-        if pdf && b.page.is_some() && b.page != page {
+        if let Some(name) = marker.filter(|_| b.page.is_some() && b.page != page) {
+            flush_notes(&mut out, &mut prev, page);
             page = b.page;
             out.push_str(if out.is_empty() { "" } else { "\n\n" });
-            out.push_str(&format!("<!-- pagina {} -->", page.unwrap_or(0)));
+            out.push_str(&format!("<!-- {} {} -->", name, page.unwrap_or(0)));
             prev = Some(Kind::PageBreak);
         }
         out.push_str(joiner(prev, b.kind));
         out.push_str(&md);
         prev = Some(b.kind);
     }
+    flush_notes(&mut out, &mut prev, page);
     let notes = notes_md(d);
     if !notes.is_empty() {
         out.push_str("\n\n");

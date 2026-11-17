@@ -76,7 +76,7 @@ struct Reader<'a> {
 }
 
 /// Resuelve un destino de relacion respecto de la carpeta de la parte que lo referencia.
-fn resolve(dir: &str, target: &str) -> String {
+pub(crate) fn resolve(dir: &str, target: &str) -> String {
     if let Some(abs) = target.strip_prefix('/') {
         return abs.to_string();
     }
@@ -94,7 +94,7 @@ fn resolve(dir: &str, target: &str) -> String {
 }
 
 /// Relaciones de una parte: lista de (id, tipo, destino, es_externo).
-fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, String, String, bool)> {
+pub(crate) fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, String, String, bool)> {
     let mut out = Vec::new();
     if let Some(src) = zip.read_text(rels_path) {
         let mut x = Xml::new(&src);
@@ -115,7 +115,7 @@ fn relationships(zip: &ZipArchive, rels_path: &str) -> Vec<(String, String, Stri
     out
 }
 
-fn roman(mut n: i64, upper: bool) -> String {
+pub(crate) fn roman(mut n: i64, upper: bool) -> String {
     const T: [(i64, &str); 13] =
         [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")];
     if n <= 0 || n > 3999 {
@@ -136,7 +136,7 @@ fn roman(mut n: i64, upper: bool) -> String {
 }
 
 /// a, b, ..., z, aa, bb, ... (asi numera Word).
-fn letters(n: i64, upper: bool) -> String {
+pub(crate) fn letters(n: i64, upper: bool) -> String {
     if n <= 0 {
         return n.to_string();
     }
@@ -733,7 +733,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, String> {
+pub(crate) fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, String> {
     let (dir, file) = match part.rfind('/') {
         Some(i) => (&part[..i], &part[i + 1..]),
         None => ("", part),
@@ -743,7 +743,7 @@ fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, String> {
 }
 
 /// Propiedades del documento (docProps/core.xml y app.xml).
-fn properties(zip: &ZipArchive, doc: &mut Document) {
+pub(crate) fn properties(zip: &ZipArchive, doc: &mut Document) {
     let mut text = HashMap::new();
     for path in ["docProps/core.xml", "docProps/app.xml"] {
         if let Some(src) = zip.read_text(path) {

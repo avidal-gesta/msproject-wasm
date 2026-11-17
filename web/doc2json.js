@@ -3,7 +3,7 @@
 //   await init('/doc2json.wasm');          // una sola vez (en Node: init(bytes del .wasm))
 //   const doc = await docToJson(archivo);  // { type, metadata, content, text, ... }
 //
-// Acepta .docx y .pdf; el formato se reconoce por el contenido. La conversion ocurre donde
+// Acepta .docx, .pdf, .pptx y .xlsx; el formato se reconoce por el contenido. La conversion ocurre donde
 // corre este codigo: el archivo no se envia a ningun servidor.
 
 let modulo; // Promise<WebAssembly.Module>
@@ -77,23 +77,23 @@ async function convertir(archivo, modo, opciones) {
   }
 }
 
-/** Convierte un .docx o un .pdf en JSON, como texto. Con `full` agrega estilos, tramos con formato y lineas de PDF. */
+/** Convierte un .docx, .pdf, .pptx o .xlsx en JSON, como texto. Con `full` agrega estilos, tramos con formato y lineas de PDF. */
 export function docToJsonText(archivo, opciones) {
   return convertir(archivo, opciones && opciones.full ? 1 : 0, opciones);
 }
 
-/** Convierte un .docx o un .pdf en un objeto con metadatos, bloques de contenido y texto plano. */
+/** Convierte un .docx, .pdf, .pptx o .xlsx en un objeto con metadatos, bloques de contenido y texto plano. */
 export async function docToJson(archivo, opciones) {
   return JSON.parse(await docToJsonText(archivo, opciones));
 }
 
-/** Convierte un .docx o un .pdf en Markdown: titulos, listas, tablas GFM y notas al pie. */
+/** Convierte un documento (Word, PDF, PowerPoint o Excel) en Markdown: titulos, listas, tablas GFM y notas al pie. */
 export function docToMarkdown(archivo, opciones) {
   return convertir(archivo, 2, opciones);
 }
 
 /**
- * Corta un .docx o un .pdf en fragmentos de hasta `maxChars` caracteres (2000 por defecto), con
+ * Corta un documento (Word, PDF, PowerPoint o Excel) en fragmentos de hasta `maxChars` caracteres (2000 por defecto), con
  * la ruta de titulos de su seccion y las paginas que cubren. Listo para indexar o enviar a un modelo.
  */
 export async function docToChunks(archivo, opciones) {

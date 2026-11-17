@@ -5,9 +5,9 @@ Dos herramientas independientes, escritas en **Rust sin ninguna dependencia**, q
 | Herramienta | Entrada | Salida | Ejecutable | WebAssembly |
 |---|---|---|---|---|
 | **mpp2xlsx** | Microsoft Project (`.mpp`) | Excel (`.xlsx`) con Gantt, y JSON | 569 KB | 339 KB (93 KB con brotli) |
-| **doc2json** | Word (`.docx`) y PDF | JSON con el contenido estructurado | 596 KB | 378 KB (120 KB con brotli) |
+| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado | 531 KB | 456 KB (142 KB con brotli) |
 
-No necesitan Microsoft Project, Word, Java ni conexión a internet. Todo el código que lee los formatos es propio: contenedor OLE2, formato MPP, ZIP, DEFLATE, XML, PDF y sus cifrados.
+No necesitan Microsoft Project, Office, Java ni conexión a internet. Todo el código que lee los formatos es propio: contenedor OLE2, formato MPP, ZIP, DEFLATE, XML, PDF y sus cifrados.
 
 ## Uso rápido
 
@@ -67,9 +67,9 @@ Detalles que se conservan de Project:
 
 ---
 
-## doc2json: Word y PDF a JSON
+## doc2json: Word, PDF, PowerPoint y Excel a JSON
 
-Los dos formatos salen con **la misma forma**, así una sola tabla en la base de datos sirve para ambos:
+Los cuatro formatos salen con **la misma forma**, así una sola tabla en la base de datos sirve para todos:
 
 ```json
 {
@@ -96,8 +96,10 @@ Los dos formatos salen con **la misma forma**, así una sola tabla en la base de
 | `text` | Todo el texto plano. |
 | `pages` | Solo PDF: tamaño y texto de cada página. |
 | `outline` | Solo PDF: marcadores (tabla de contenidos) con su página. |
+| `page` (en cada bloque) | PDF: página. PowerPoint: diapositiva. Excel: número de hoja. |
 | `headers`, `footers`, `footnotes` | Encabezados, pies y notas al pie: de Word y de PDF etiquetados, cuando existen. |
 | `endnotes`, `comments` | Solo Word, cuando existen. |
+| `notes` | Solo PowerPoint: notas del orador, con el número de la diapositiva en `label`. |
 | `warnings` | Avisos: páginas escaneadas sin texto, índice reconstruido, fuentes ilegibles. |
 
 Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de cada bloque, los tramos con formato (negrita, cursiva, enlaces) y, en PDF, cada línea con su posición y tamaño de letra.
@@ -151,6 +153,22 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 - Incluye el texto de **firmas digitales, sellos y campos de formulario**, que no está en el contenido de la página sino en anotaciones.
 - Abre PDF "protegidos" contra edición o copia (cifrado RC4 y AES-128 sin contraseña de apertura).
 - Si el índice interno del archivo está dañado, lo reconstruye recorriendo el archivo.
+
+### PowerPoint (.pptx)
+
+- Diapositivas en el orden de la presentación (no en el de los archivos internos); `page_count` es su cantidad.
+- Dentro de cada diapositiva, **orden de lectura**: el título primero y luego de arriba hacia abajo y de izquierda a derecha, también dentro de los grupos de formas.
+- El título sale como `heading`; el texto de los marcadores de contenido, como `list_item` con su nivel y su viñeta o numeración automática (`1.`, `a)`, `IV.`); los cuadros de texto, como párrafos.
+- Tablas con celdas combinadas, imágenes con su texto alternativo y notas del orador aparte, en `notes`.
+- Se omite lo que no es contenido (número de diapositiva, fecha y pie) y las diapositivas ocultas, con un aviso en `warnings`.
+
+### Excel (.xlsx)
+
+- Cada hoja visible sale como un `heading` con su nombre y una `table` con los valores **como los muestra Excel**: fechas y horas en ISO 8601 (también en libros con sistema de fechas 1904), porcentajes con `%`, tiempos transcurridos (`[h]:mm`) en horas totales, `TRUE`/`FALSE` y errores (`#N/A`) tal cual.
+- Números sin ruido de coma flotante: `0.30000000000000004` sale `0.3`.
+- De las fórmulas se toma el último valor que calculó Excel; no se recalculan.
+- Se quitan las filas y columnas vacías, también las intermedias; las celdas combinadas pasan a `colspan`/`rowspan`.
+- Se omiten las hojas ocultas, con un aviso en `warnings`.
 
 ---
 
@@ -245,7 +263,7 @@ Los valores por defecto son holgados: en 900 documentos de oficina reales el má
 create table documentos (
   id          uuid primary key default gen_random_uuid(),
   archivo     text not null,
-  tipo        text not null,                 -- 'docx' o 'pdf'
+  tipo        text not null,                 -- 'docx', 'pdf', 'pptx' o 'xlsx'
   titulo      text,
   autor       text,
   paginas     int,
@@ -411,8 +429,9 @@ node web/prueba.mjs
 - No abre PDF con cifrado AES-256 ni los que piden contraseña para abrirse: da un mensaje claro.
 - Si un PDF usa fuentes sin tabla de caracteres, ese texto es ilegible para cualquier extractor (también al copiar y pegar desde un visor).
 - Las imágenes se cuentan y, en Word, se nombran; no se extraen.
-- En Word no se lee el texto de gráficos ni de diagramas SmartArt.
-- No lee `.doc` antiguos (Word 97-2003): da un mensaje pidiendo guardarlos como `.docx`.
+- En Word y PowerPoint no se lee el texto de gráficos ni de diagramas SmartArt; en Excel no se leen gráficos, imágenes ni comentarios.
+- En Excel no se recalculan fórmulas ni se aplican los formatos de número completos (separador de miles, decimales fijos, moneda): los números salen con su valor exacto.
+- No lee `.doc`, `.xls` ni `.ppt` antiguos (Office 97-2003), ni libros binarios `.xlsb`, ni archivos de Office con contraseña de apertura: da un mensaje pidiendo guardarlos en el formato actual.
 
 **Ambos:** el texto se copia tal cual está en el archivo. Si el origen ya trae caracteres dañados (por ejemplo `Araï¿½a` en vez de `Araña` en una exportación desde SAP), salen igual.
 
@@ -436,9 +455,15 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - Descifrado probado con RC4 de 40 y 128 bits y AES-128, con y sin flujos de objetos: mismo texto que el original.
 - Páginas apaisadas y rotadas (90°, 180°, 270°) y texto a dos columnas: mismo orden de lectura que la referencia.
 
+**doc2json, PowerPoint y Excel** contra python-pptx y openpyxl
+
+- 162 presentaciones reales: coincide el 99,8 % de los caracteres y no hay texto duplicado. El resto también está, cortado distinto: los saltos de línea dentro de una celda de tabla se conservan como tales.
+- 1.003 planillas reales (2,2 millones de celdas con valor): coincide el 99,8 % de las celdas. Lo que no coincide son textos con escapes `_xHHHH_` que la referencia deja sin decodificar (Excel los muestra decodificados, como aquí), valores tapados por una combinación de celdas que Excel no muestra, y 112 números.
+
 **Resistencia**
 
 - 1.500 PDF (6.127 páginas) y 400 Word reales: ningún fallo ni cuelgue; 51 ms por archivo en promedio.
+- 162 presentaciones y 1.003 planillas reales: ningún fallo ni cuelgue; mediana de 39 ms por presentación y 16 ms por planilla. Los únicos errores fueron archivos de bloqueo de Office y uno truncado, con un mensaje claro.
 - 460 archivos dañados a propósito (truncados, con bytes alterados, con tramos borrados): todos terminan en lectura parcial o en un error claro.
 - Archivos "bomba" armados en `doc2json/tests/presupuesto.rs` (un `.docx` de ~250 KB que descomprime 40 MB, un PDF con un flujo que descomprime 30 MB, un PDF de 50 páginas): se cortan en el límite pedido con su aviso, sin afectar a la lectura siguiente.
 - En todas las herramientas, el archivo generado en el navegador es idéntico byte a byte al del ejecutable.
@@ -459,6 +484,8 @@ doc2json/src/           doc2json
   inflate.rs            descompresor DEFLATE / zlib
   zipread.rs  xml.rs    lector ZIP y lector XML
   docx.rs               lector de Word: estilos, numeración, tablas, notas
+  pptx.rs               lector de PowerPoint: orden de lectura, viñetas, tablas, notas
+  xlsx.rs               lector de Excel: textos compartidos, formatos de fecha, combinaciones
   pdf/
     object.rs           objetos de PDF y su analizador
     document.rs         tabla de referencias, objetos, páginas, metadatos
@@ -475,6 +502,7 @@ doc2json/src/           doc2json
 doc2json/tests/
   ejemplo.rs            pruebas de punta a punta con los archivos de ejemplo/
   presupuesto.rs        archivos "bomba" armados en la prueba y los límites de recursos
+  office.rs             PowerPoint y Excel con paquetes armados en la prueba
 web/
   mpp2xlsx.js  .d.ts  .wasm     módulo de Project
   doc2json.js  .d.ts  .wasm     módulo de documentos

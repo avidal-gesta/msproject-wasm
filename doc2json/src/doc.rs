@@ -1,4 +1,4 @@
-//! Modelo comun de documento (Word o PDF) y su salida JSON.
+//! Modelo comun de documento (Word, PDF, PowerPoint o Excel) y su salida JSON.
 //!
 //! Los dos formatos terminan en la misma forma: metadatos, una lista de bloques de contenido
 //! (titulos, parrafos, items de lista, tablas) y el texto plano completo. Asi una sola tabla

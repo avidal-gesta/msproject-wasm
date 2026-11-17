@@ -1,5 +1,5 @@
 //! Linea de comandos:
-//! `doc2json <archivo.docx|archivo.pdf> [salida] [--full | --markdown | --fragmentos[=N]] [--max-mb=N] [--max-paginas=N] [--max-caracteres=N]`
+//! `doc2json <archivo.docx|.pdf|.pptx|.xlsx> [salida] [--full | --markdown | --fragmentos[=N]] [--max-mb=N] [--max-paginas=N] [--max-caracteres=N]`
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -83,7 +83,7 @@ fn say(msg: &str) {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("Uso: doc2json <archivo.docx|archivo.pdf> [salida] [--full | --markdown | --fragmentos[=N]] [--max-mb=N] [--max-paginas=N] [--max-caracteres=N]");
+    eprintln!("Uso: doc2json <archivo.docx|.pdf|.pptx|.xlsx> [salida] [--full | --markdown | --fragmentos[=N]] [--max-mb=N] [--max-paginas=N] [--max-caracteres=N]");
     eprintln!("  --full              JSON con estilos, formato y lineas de cada pagina");
     eprintln!("  --markdown          Markdown (tablas GFM, notas al pie, marcas de pagina en PDF)");
     eprintln!("  --fragmentos=N      fragmentos de hasta N caracteres por seccion, en JSON (por defecto 2000)");
