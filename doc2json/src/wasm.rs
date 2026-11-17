@@ -1,9 +1,19 @@
 //! Interfaz WebAssembly "a mano" (sin wasm-bindgen), con el mismo protocolo que mpp2xlsx:
 //!   1. `ptr = doc_alloc(n)` y copiar los bytes del documento en la memoria del modulo.
-//!   2. `estado = doc_convert(ptr, n, modo)`: modo 0 = JSON, 1 = JSON completo, 2 = Markdown,
-//!      3 = fragmentos en JSON (el tamano maximo en caracteres va en los bits altos: `3 | (n << 8)`).
-//!      Sumando 4 al modo 0 o 1 se extraen tambien las imagenes, y `modo | (lado_minimo << 8)`
-//!      omite los bytes de las imagenes mas chicas que eso: el resultado es `[u32 largo][JSON][bytes]`.
+//!   2. `estado = doc_convert(ptr, n, modo)`. El byte bajo de `modo` es la operacion y los bits
+//!      8 a 31 su parametro (`operacion | (parametro << 8)`):
+//!
+//!      | operacion | salida                     | parametro                               |
+//!      |-----------|----------------------------|-----------------------------------------|
+//!      | 0         | JSON                       | -                                       |
+//!      | 1         | JSON completo              | -                                       |
+//!      | 2         | Markdown                   | -                                       |
+//!      | 3         | fragmentos en JSON         | tamano maximo en caracteres (0 = 2000)  |
+//!      | 4         | JSON con imagenes          | lado minimo de las imagenes             |
+//!      | 5         | JSON completo con imagenes | lado minimo de las imagenes             |
+//!
+//!      Una operacion que el modulo no conoce da error ("Modo de conversion desconocido."), nunca
+//!      otra salida.
 //!   3. Leer `doc_result_len()` bytes desde `doc_result_ptr()`:
 //!      con estado 0 es el JSON en UTF-8 o, con imagenes, `[largo del JSON: u32 LE][JSON][bytes de
 //!      las imagenes]` (cada imagen del JSON trae su `offset` y `length` en ese bloque final);

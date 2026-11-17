@@ -113,6 +113,8 @@ Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de c
 
 Los mismos bloques salen también como **Markdown** (`--markdown`, `docToMarkdown`): títulos con `#` según su nivel, listas con su numeración o viñeta e indentación, tablas GFM (las celdas combinadas dejan su lugar vacío, sin filas ni columnas en blanco), notas al pie como `[^1]` y, en Word, **negrita**, *cursiva* y enlaces. En PDF cada página empieza con `<!-- pagina N -->`, para citar de dónde sale cada parte.
 
+El texto del documento **nunca se vuelve marca ni HTML**: se escapan `<`, `[`, `]`, `` ` ``, las entidades (`&lt;`), las barras invertidas y lo que al inicio de una línea abriría un título, una cita, una lista o una línea horizontal. Los enlaces de Word solo salen si son `http`, `https` o `mailto`; los demás (`javascript:`, `data:`, `file:`…) quedan como texto. Así el Markdown se puede mostrar como HTML sin que un documento inyecte etiquetas o enlaces. Una celda no ocupa más de 64 columnas y una tabla no pasa de 64: lo que sobra se junta en la última columna, sin perder texto.
+
 Y como **fragmentos** listos para indexar o enviar a un modelo (`--fragmentos[=N]`, `docToChunks`), de hasta N caracteres (2000 por defecto, unos 500 tokens en castellano):
 
 ```json
@@ -122,8 +124,9 @@ Y como **fragmentos** listos para indexar o enviar a un modelo (`--fragmentos[=N
 
 - Cada fragmento empieza en un título cuando se puede y trae en `path` los títulos de las secciones que lo contienen; en PDF, `pages` con la primera y la última página.
 - Nunca corta un bloque, salvo que el bloque solo sea más grande que el fragmento: un párrafo se corta al final de una oración, una tabla por filas repitiendo el encabezado, y una fila con una celda enorme en filas de continuación con las mismas columnas.
-- Una sección más corta que 200 caracteres se junta con la siguiente; un título queda con el bloque que lo sigue.
-- Muchas plantillas escriben los títulos de sección como una tabla de una sola celda ("1. OBJETIVO"): se tratan como título, con el nivel que dé su numeración.
+- Una sección más corta que 200 caracteres se junta con la siguiente; un título queda con el bloque que lo sigue: si ese bloque no cabe, el título pasa con él al fragmento siguiente.
+- En `path` cada título va en una línea y con 200 caracteres como máximo (el texto del fragmento lo trae completo).
+- Muchas plantillas escriben los títulos de sección como una tabla de una sola celda ("1. OBJETIVO"): se tratan como título, con el nivel que dé su numeración, si el texto está numerado ("3.2 Responsables") o en mayúsculas. Un recuadro con una advertencia ("Use casco en todo momento") sigue siendo tabla.
 - Las notas al pie van en un fragmento final con ruta `["Notas"]`.
 
 ### Word (.docx)
@@ -290,6 +293,21 @@ const doc = await docToJson(bytes, { limits: { maxDecompressedMB: 32, maxPages: 
 ```
 
 Los valores por defecto son holgados: en 900 documentos de oficina reales el máximo fue 40 MB descomprimidos (mediana 0,7 MB), 572 páginas y 2,5 millones de caracteres, y con ellos la salida es idéntica byte a byte a la de una lectura sin límites. Con un `.docx` de 1,5 MB que descomprime 250 MB, la memoria máxima del proceso pasa de 2,9 GB (sin presupuesto) a 875 MB por defecto y a 464 MB con `maxDecompressedMB: 32`. En Rust: `doc2json::read_with_limits(bytes, Limits { … })`.
+
+### El `.wasm` sin el cargador
+
+Quien llame al módulo directamente (sin `doc2json.js`) usa `doc_convert(ptr, largo, modo)`. El byte bajo de `modo` es la operación y los bits 8 a 31 su parámetro (`operación | (parámetro << 8)`):
+
+| Operación | Salida | Parámetro |
+|---|---|---|
+| 0 | JSON | — |
+| 1 | JSON completo | — |
+| 2 | Markdown | — |
+| 3 | Fragmentos en JSON | tamaño máximo en caracteres (0 = 2000) |
+| 4 | JSON con imágenes | lado mínimo de las imágenes |
+| 5 | JSON completo con imágenes | lado mínimo de las imágenes |
+
+Una operación que el módulo no conoce da error («Modo de conversion desconocido.»), nunca otra salida. El protocolo completo está al inicio de `doc2json/src/wasm.rs`.
 
 ### Guardar documentos en Supabase
 

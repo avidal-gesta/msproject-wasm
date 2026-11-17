@@ -28,6 +28,10 @@ pub struct Run {
     pub link: Option<String>,
 }
 
+/// Columnas que puede ocupar una celda (`colspan`). Word no pasa de 63 columnas; el valor del
+/// archivo se acota para que una celda que dice ocupar millones no se materialice.
+pub const MAX_COLSPAN: u32 = 64;
+
 #[derive(Clone, Default, Debug)]
 pub struct Cell {
     pub text: String,

@@ -120,7 +120,10 @@ export async function docToMarkdown(archivo, opciones) {
  * la ruta de titulos de su seccion y las paginas que cubren. Listo para indexar o enviar a un modelo.
  */
 export async function docToChunks(archivo, opciones) {
-  const n = Math.floor((opciones && opciones.maxChars) || 0);
-  if (n < 0 || n > 0xffffff) throw new RangeError('maxChars debe estar entre 1 y 16777215.');
-  return JSON.parse(new TextDecoder().decode(await convertir(archivo, 3 + n * 256, opciones)));
+  const valor = opciones == null ? undefined : opciones.maxChars;
+  if (valor !== undefined && !(Number.isInteger(valor) && valor >= 1 && valor <= 0xffffff)) {
+    throw new RangeError('maxChars debe ser un entero entre 1 y 16777215.');
+  }
+  // 0 = tamano por defecto. El modo cabe en 32 bits sin signo; WebAssembly lo recibe igual.
+  return JSON.parse(new TextDecoder().decode(await convertir(archivo, 3 + (valor || 0) * 256, opciones)));
 }

@@ -9,8 +9,13 @@
 //!   modelo: cada fragmento empieza en un titulo cuando se puede, nunca corta un bloque (salvo que
 //!   el bloque solo ya sea mas grande que el fragmento) y trae la ruta de titulos de su seccion y
 //!   las paginas que cubre. Las tablas largas se parten por filas repitiendo el encabezado.
+//!
+//! El texto del documento nunca se vuelve marca: se escapan `<`, `[`, `]`, `` ` ``, las entidades
+//! (`&lt;`), las barras invertidas y lo que al inicio de una linea abriria un titulo, una cita, una
+//! lista o una linea horizontal. Asi el Markdown se puede mostrar como HTML sin que el documento
+//! inyecte etiquetas ni enlaces. Los enlaces de Word solo salen si son `http`, `https` o `mailto`.
 
-use crate::doc::{Block, Cell, Document, Kind};
+use crate::doc::{Block, Cell, Document, Kind, MAX_COLSPAN};
 use crate::json::{self, Obj};
 use std::collections::HashSet;
 
@@ -18,18 +23,56 @@ use std::collections::HashSet;
 pub const DEFAULT_CHUNK: usize = 2000;
 /// Una seccion mas corta que esto no cierra su fragmento: se junta con la siguiente.
 const MIN_CHUNK: usize = 200;
+/// Largo maximo de cada titulo en la ruta (`path`) de un fragmento; el texto lo trae completo.
+const MAX_PATH_CHARS: usize = 200;
+/// Columnas de una tabla en Markdown. Las celdas que pasan de ahi se juntan en la ultima columna:
+/// asi una fila con miles de celdas no obliga a rellenar todas las demas filas hasta ese ancho.
+const MAX_COLS: usize = 64;
 
-/// Escapa lo que Markdown leeria como marca al inicio de una linea (titulo, cita, lista).
+/// Escapa lo que Markdown leeria como marca o HTML dentro de una linea de texto: `<` (etiquetas y
+/// enlaces automaticos), `[` y `]` (enlaces, imagenes y definiciones), `` ` `` (codigo), `&` cuando
+/// forma una entidad, y las barras invertidas que escaparian el caracter siguiente.
+fn escape_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut it = text.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        match c {
+            // Al final tambien: el texto puede quedar pegado a una marca ("<br>" en una celda).
+            '\\' if it.peek().map_or(true, |(_, n)| n.is_ascii_punctuation()) => out.push_str("\\\\"),
+            '<' | '[' | ']' | '`' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '&' if is_entity(&text[i + 1..]) => out.push_str("\\&"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `rest` empieza como el resto de una entidad HTML (`lt;`, `#60;`, `#x3C;`) tras el `&`.
+fn is_entity(rest: &str) -> bool {
+    let body = rest.strip_prefix('#').unwrap_or(rest);
+    let n = body.bytes().take(32).take_while(u8::is_ascii_alphanumeric).count();
+    n > 0 && body.as_bytes().get(n) == Some(&b';')
+}
+
+/// Escapa lo que Markdown leeria como marca al inicio de una linea (titulo, cita, lista, linea
+/// horizontal, subrayado de titulo, bloque de codigo). Quita la sangria: cuatro espacios serian codigo.
 fn escape_start(text: &str) -> String {
     let t = text.trim_start();
     let first = t.chars().next();
+    let only = |c: char, min: usize| t.chars().all(|x| x == c || x == ' ' || x == '\t') && t.chars().filter(|x| *x == c).count() >= min;
     let needs = match first {
         Some('#') | Some('>') => true,
-        Some('-') | Some('+') | Some('*') => t.chars().nth(1).is_none_or(|c| c == ' '),
+        Some('=') => only('=', 1),
+        Some('~') => t.starts_with("~~~"),
+        Some('-') | Some('+') | Some('*') | Some('_') if only(first.unwrap_or(' '), 3) => true,
+        Some('-') | Some('+') | Some('*') => t.chars().nth(1).map_or(true, |c| c == ' ' || c == '\t'),
         Some(c) if c.is_ascii_digit() => {
             let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
             let rest = &t[digits.len()..];
-            (rest.starts_with(". ") || rest.starts_with(") ")) && digits.len() <= 9
+            (rest.starts_with(". ") || rest.starts_with(") ") || rest == "." || rest == ")") && digits.len() <= 9
         }
         _ => false,
     };
@@ -40,11 +83,76 @@ fn escape_start(text: &str) -> String {
     }
 }
 
+/// Escapa el inicio de cada linea de un texto de varias lineas.
+fn escape_lines(text: &str) -> String {
+    text.split('\n').map(escape_start).collect::<Vec<_>>().join("\n")
+}
+
+/// Un enlace que se puede publicar: solo `http`, `https` y `mailto`, con los caracteres que
+/// cortarian el destino de Markdown codificados. Cualquier otro esquema (`javascript:`, `data:`,
+/// `file:`...) o un destino interno del documento queda fuera.
+fn safe_url(link: &str) -> Option<String> {
+    let link = link.trim();
+    let (scheme, _) = link.split_once(':')?;
+    if !["http", "https", "mailto"].iter().any(|s| scheme.eq_ignore_ascii_case(s)) {
+        return None;
+    }
+    Some(encode_url(link))
+}
+
+fn encode_url(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            ' ' => out.push_str("%20"),
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '"' => out.push_str("%22"),
+            '\\' => out.push_str("%5C"),
+            '`' => out.push_str("%60"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Texto con las citas "[n]" de notas que existen como "[^n]" (nota al pie de Markdown) y todo lo
+/// demas escapado.
+fn text_md(text: &str, labels: &HashSet<String>) -> String {
+    if labels.is_empty() || !text.contains('[') {
+        return escape_text(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    while let Some(i) = rest.find('[') {
+        out.push_str(&escape_text(&rest[..i]));
+        let after = &rest[i + 1..];
+        match after.find(']') {
+            Some(j) if labels.contains(&after[..j]) => {
+                out.push_str("[^");
+                out.push_str(&after[..j]);
+                out.push(']');
+                rest = &after[j + 1..];
+            }
+            _ => {
+                out.push_str("\\[");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(&escape_text(rest));
+    out
+}
+
 /// Texto de un bloque con su formato de Word (negrita, cursiva, enlaces) si lo trae.
-fn inline(b: &Block) -> String {
+fn inline(b: &Block, labels: &HashSet<String>) -> String {
     let joined: String = b.runs.iter().map(|r| r.text.as_str()).collect();
-    if b.runs.is_empty() || joined != b.text || !b.runs.iter().any(|r| r.bold || r.italic || r.link.is_some()) {
-        return b.text.clone();
+    // El texto del bloque viene recortado y los tramos no: se comparan sin los espacios de los bordes.
+    if b.runs.is_empty() || joined.trim() != b.text.trim() || !b.runs.iter().any(|r| r.bold || r.italic || r.link.is_some()) {
+        return text_md(&b.text, labels);
     }
     let mut out = String::new();
     for r in &b.runs {
@@ -56,62 +164,46 @@ fn inline(b: &Block) -> String {
         }
         let lead = &r.text[..r.text.len() - r.text.trim_start().len()];
         let tail = &r.text[r.text.trim_end().len()..];
-        let mut s = core.to_string();
+        let mut s = text_md(core, labels);
         if r.italic {
             s = format!("*{}*", s);
         }
         if r.bold {
             s = format!("**{}**", s);
         }
-        if let Some(link) = &r.link {
-            if link.starts_with("http") || link.starts_with("mailto:") {
-                s = format!("[{}]({})", s, link.replace(' ', "%20").replace(')', "%29"));
-            }
+        if let Some(url) = r.link.as_deref().and_then(safe_url) {
+            s = format!("[{}]({})", s, url);
         }
         out.push_str(lead);
         out.push_str(&s);
         out.push_str(tail);
     }
-    out
-}
-
-/// Citas "[n]" de notas que existen: pasan a "[^n]" (nota al pie de Markdown).
-fn footnote_refs(text: &str, labels: &HashSet<String>) -> String {
-    if labels.is_empty() || !text.contains('[') {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len() + 8);
-    let mut rest = text;
-    while let Some(i) = rest.find('[') {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + 1..];
-        match after.find(']') {
-            Some(j) if labels.contains(&after[..j]) => {
-                out.push_str("[^");
-                out.push_str(&after[..j]);
-                out.push(']');
-                rest = &after[j + 1..];
-            }
-            _ => {
-                out.push('[');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    out.trim().to_string()
 }
 
 fn cell_text(c: &Cell) -> String {
     if c.merged {
         return String::new();
     }
-    c.text.trim().replace('|', "\\|").replace("\r\n", "\n").split('\n').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("<br>")
+    c.text
+        .trim()
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| escape_text(s).replace('|', "\\|"))
+        .collect::<Vec<_>>()
+        .join("<br>")
 }
 
-/// Celdas de cada fila de una tabla, ya escapadas y todas con el mismo numero de columnas.
+fn span(c: &Cell) -> usize {
+    c.colspan.clamp(1, MAX_COLSPAN) as usize
+}
+
+/// Celdas de cada fila de una tabla, ya escapadas y todas con el mismo numero de columnas (como
+/// mucho `MAX_COLS`: lo que sobra se junta en la ultima).
 fn table_cells(rows: &[Vec<Cell>]) -> Vec<Vec<String>> {
-    let width = rows.iter().map(|r| r.iter().map(|c| c.colspan.max(1) as usize).sum::<usize>()).max().unwrap_or(0).max(1);
+    let width = rows.iter().map(|r| r.iter().map(span).sum::<usize>()).max().unwrap_or(0).clamp(1, MAX_COLS);
     rows.iter()
         .enumerate()
         // Las filas sin ningun texto (formularios por llenar) no aportan; la primera se deja como encabezado.
@@ -119,11 +211,20 @@ fn table_cells(rows: &[Vec<Cell>]) -> Vec<Vec<String>> {
         .map(|(_, r)| {
             let mut cells: Vec<String> = Vec::with_capacity(width);
             for c in r {
-                cells.push(cell_text(c));
-                // Una celda que ocupa varias columnas deja las siguientes vacias.
-                for _ in 1..c.colspan.max(1) {
-                    cells.push(String::new());
+                let text = cell_text(c);
+                if cells.len() >= width {
+                    if let Some(last) = cells.last_mut().filter(|_| !text.is_empty()) {
+                        if !last.is_empty() {
+                            last.push(' ');
+                        }
+                        last.push_str(&text);
+                    }
+                    continue;
                 }
+                cells.push(text);
+                // Una celda que ocupa varias columnas deja las siguientes vacias.
+                let pad = (span(c) - 1).min(width - cells.len());
+                cells.resize(cells.len() + pad, String::new());
             }
             cells.resize(width, String::new());
             cells
@@ -152,11 +253,6 @@ fn row_line(cells: &[String]) -> String {
     format!("| {} |", cells.join(" | "))
 }
 
-/// Filas de una tabla como lineas GFM.
-fn table_rows(rows: &[Vec<Cell>]) -> Vec<String> {
-    table_cells(rows).iter().map(|c| row_line(c)).collect()
-}
-
 /// Una fila demasiado larga para un fragmento se reparte en filas de continuacion con las mismas
 /// columnas: cada celda larga se corta (en una oracion o un espacio) y sus partes van una por fila.
 fn split_row(cells: &[String], room: usize) -> Vec<String> {
@@ -177,19 +273,20 @@ fn separator(width: usize) -> String {
 }
 
 fn table_md(rows: &[Vec<Cell>]) -> String {
-    let lines = table_rows(rows);
-    if lines.is_empty() {
+    let cells = table_cells(rows);
+    let Some(first) = cells.first() else {
         return String::new();
-    }
-    let width = lines[0].matches(" | ").count() + 1;
-    let mut out = vec![lines[0].clone(), separator(width)];
-    out.extend(lines[1..].iter().cloned());
+    };
+    let mut out = vec![row_line(first), separator(first.len())];
+    out.extend(cells[1..].iter().map(|c| row_line(c)));
     out.join("\n")
 }
 
-/// Titulo de seccion de un bloque: (nivel, texto). Ademas de los titulos, muchas plantillas
-/// escriben los de seccion ("1. OBJETIVO") como una tabla de una sola celda con texto corto;
-/// esas tablas cuentan como titulo, con el nivel que de su numeracion ("3.2" = 2).
+/// Titulo de seccion de un bloque: (nivel, texto sin escapar). Ademas de los titulos, muchas
+/// plantillas escriben los de seccion ("1. OBJETIVO") como una tabla de una sola celda con texto
+/// corto; esas tablas cuentan como titulo, con el nivel que de su numeracion ("3.2" = 2), solo si
+/// el texto parece titulo: numerado ("3.2 Responsables") o en mayusculas ("OBJETIVO"). Un recuadro
+/// con una advertencia ("Use casco en todo momento") sigue siendo tabla.
 fn section(b: &Block) -> Option<(u8, String)> {
     match b.kind {
         Kind::Title => Some((0, b.text.trim().to_string())),
@@ -203,8 +300,14 @@ fn section(b: &Block) -> Option<(u8, String)> {
             if t.contains('\n') || t.chars().count() > 80 || t.chars().filter(|c| c.is_alphabetic()).count() < 3 {
                 return None;
             }
-            let token = t.split_whitespace().next().unwrap_or("").trim_end_matches('.');
-            let depth = if !token.is_empty() && token.split('.').all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|c| c.is_ascii_digit())) { token.split('.').count() } else { 1 };
+            let raw = t.split_whitespace().next().unwrap_or("");
+            let token = raw.trim_end_matches('.');
+            let numbered = raw.contains('.') && raw.len() < t.len() && !token.is_empty() && token.split('.').all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|c| c.is_ascii_digit()));
+            let upper = t.chars().filter(|c| c.is_alphabetic()).all(char::is_uppercase);
+            if !numbered && !upper {
+                return None;
+            }
+            let depth = if numbered { token.split('.').count() } else { 1 };
             Some((depth.min(6) as u8, t.to_string()))
         }
         _ => None,
@@ -217,36 +320,48 @@ struct Ctx {
     labels: HashSet<String>,
 }
 
+/// Una etiqueta de nota que se puede escribir como `[^etiqueta]` sin romper la sintaxis.
+fn safe_label(l: &str) -> bool {
+    !l.is_empty() && l.chars().count() <= 16 && l.chars().all(|c| c.is_alphanumeric() || "*†‡§¶#-_.".contains(c))
+}
+
 /// Markdown de un bloque (sin la marca de pagina). Vacio si el bloque no aporta texto.
 fn block_md(b: &Block, cx: &Ctx) -> String {
-    let text = || footnote_refs(&inline(b), &cx.labels);
+    let text = || inline(b, &cx.labels);
+    // Un titulo es una sola linea: un salto dentro de el lo cortaria.
+    let one_line = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
     match b.kind {
-        Kind::Title => format!("# {}", text().trim()),
-        Kind::Heading => format!("{} {}", "#".repeat((b.level.max(1) + cx.offset).min(6) as usize), text().trim()),
-        Kind::Paragraph => escape_start(&text()),
+        Kind::Title => format!("# {}", one_line(text())),
+        Kind::Heading => format!("{} {}", "#".repeat((b.level.max(1) + cx.offset).min(6) as usize), one_line(text())),
+        Kind::Paragraph => escape_lines(&text()),
         Kind::ListItem => {
             let indent = "  ".repeat(b.level as usize);
             let marker = b.marker.as_deref().unwrap_or("").trim();
             let numbered = !marker.is_empty() && marker.trim_end_matches(['.', ')']).chars().all(|c| c.is_ascii_digit()) && marker.len() <= 10 && (marker.ends_with('.') || marker.ends_with(')'));
-            let body = text();
+            let body = escape_lines(text().trim());
             if numbered {
-                format!("{}{} {}", indent, marker, body.trim())
+                format!("{}{} {}", indent, marker, body)
             } else if b.ordered && !marker.is_empty() {
                 // "a)", "iv.", "3.2.1": Markdown no los numera; se dejan escritos.
-                format!("{}- {} {}", indent, marker, body.trim())
+                format!("{}- {} {}", indent, escape_text(marker), body)
             } else {
-                format!("{}- {}", indent, body.trim())
+                format!("{}- {}", indent, body)
             }
         }
         Kind::Table => match section(b) {
-            Some((level, t)) => format!("{} {}", "#".repeat((level.max(1) + cx.offset).min(6) as usize), t),
+            Some((level, t)) => format!("{} {}", "#".repeat((level.max(1) + cx.offset).min(6) as usize), escape_text(&t)),
             None => table_md(&b.rows),
         },
         Kind::Image => {
-            let alt = b.text.trim().replace(['[', ']'], "");
+            let alt = one_line(escape_text(&b.text.replace(['[', ']'], "")));
             match &b.name {
-                Some(n) => format!("![{}]({})", alt, n.replace(' ', "%20")),
-                None if !alt.is_empty() => format!("*[Imagen: {}]*", alt),
+                Some(n) => {
+                    // Un nombre con ":" antes de la primera "/" se leeria como esquema ("javascript:").
+                    let n = encode_url(n.trim());
+                    let local = if n.split('/').next().is_some_and(|p| p.contains(':')) { format!("./{}", n) } else { n };
+                    format!("![{}]({})", alt, local)
+                }
+                None if !alt.is_empty() => format!("*\\[Imagen: {}\\]*", alt),
                 None => String::new(),
             }
         }
@@ -260,6 +375,7 @@ fn context(d: &Document) -> Ctx {
         .iter()
         .filter(|(k, _)| *k == "footnotes" || *k == "endnotes")
         .flat_map(|(_, v)| v.iter().filter_map(|b| b.label.clone()))
+        .filter(|l| safe_label(l))
         .collect();
     Ctx { offset: if d.content.iter().any(|b| b.kind == Kind::Title) { 1 } else { 0 }, labels }
 }
@@ -272,8 +388,9 @@ fn notes_md(d: &Document) -> String {
             continue;
         }
         for b in blocks {
-            if let Some(l) = &b.label {
-                out.push(format!("[^{}]: {}", l, b.text.trim()));
+            if let Some(l) = b.label.as_deref().filter(|l| safe_label(l)) {
+                let text = escape_text(&b.text.split_whitespace().collect::<Vec<_>>().join(" "));
+                out.push(format!("[^{}]: {}", l, text));
             }
         }
     }
@@ -354,25 +471,38 @@ pub struct Chunk {
     pub pages: Option<(u32, u32)>,
 }
 
+/// Titulos con que termina el fragmento en curso: pasan al siguiente si su contenido no cabe.
+#[derive(Clone, Copy)]
+struct Tail {
+    /// Posicion en bytes de `cur.text` donde empiezan (antes del separador).
+    at: usize,
+    /// Paginas del fragmento antes de esos titulos.
+    pages_before: Option<(u32, u32)>,
+    /// Paginas de los titulos.
+    pages: Option<(u32, u32)>,
+}
+
 struct Builder {
     max: usize,
     out: Vec<Chunk>,
     cur: Chunk,
+    /// Caracteres de `cur.text`: se lleva la cuenta para no recontar el fragmento en cada bloque.
+    chars: usize,
     prev: Option<Kind>,
     /// El fragmento en curso solo tiene titulos: acompanan al bloque que sigue aunque sea grande.
     only_headings: bool,
+    tail: Option<Tail>,
+}
+
+fn widen(range: Option<(u32, u32)>, p: Option<u32>) -> Option<(u32, u32)> {
+    match (range, p) {
+        (Some((a, b)), Some(p)) => Some((a.min(p), b.max(p))),
+        (None, Some(p)) => Some((p, p)),
+        (r, None) => r,
+    }
 }
 
 impl Builder {
-    fn add_page(&mut self, p: Option<u32>) {
-        if let Some(p) = p {
-            self.cur.pages = Some(match self.cur.pages {
-                Some((a, b)) => (a.min(p), b.max(p)),
-                None => (p, p),
-            });
-        }
-    }
-
     fn emit(&mut self) {
         if !self.cur.text.trim().is_empty() {
             let mut c = std::mem::take(&mut self.cur);
@@ -380,8 +510,29 @@ impl Builder {
             self.out.push(c);
         }
         self.cur = Chunk::default();
+        self.chars = 0;
         self.prev = None;
         self.only_headings = false;
+        self.tail = None;
+    }
+
+    /// Cierra el fragmento en curso porque el bloque que sigue no cabe. Si el fragmento termina en
+    /// titulos, esos titulos pasan al fragmento nuevo junto a su contenido (con la ruta `path`).
+    fn close_before(&mut self, path: &[String]) {
+        match self.tail {
+            Some(t) if t.at > 0 && !self.only_headings => {
+                let carried = self.cur.text[t.at..].trim_start().to_string();
+                self.cur.text.truncate(t.at);
+                self.cur.pages = t.pages_before;
+                self.emit();
+                self.chars = carried.chars().count();
+                self.cur = Chunk { path: path.to_vec(), text: carried, pages: t.pages };
+                self.prev = Some(Kind::Heading);
+                self.only_headings = true;
+                self.tail = Some(Tail { at: 0, pages_before: None, pages: t.pages });
+            }
+            _ => self.emit(),
+        }
     }
 
     fn push(&mut self, md: &str, kind: Kind, page: Option<u32>, path: &[String]) {
@@ -391,22 +542,32 @@ impl Builder {
         } else if kind != Kind::Heading {
             self.only_headings = false;
         }
-        self.cur.text.push_str(joiner(self.prev, kind));
+        if kind == Kind::Heading {
+            let t = self.tail.get_or_insert(Tail { at: self.cur.text.len(), pages_before: self.cur.pages, pages: None });
+            t.pages = widen(t.pages, page);
+        } else {
+            self.tail = None;
+        }
+        let j = joiner(self.prev, kind);
+        self.cur.text.push_str(j);
         self.cur.text.push_str(md);
+        self.chars += j.len() + md.chars().count();
         self.prev = Some(kind);
-        self.add_page(page);
+        self.cur.pages = widen(self.cur.pages, page);
     }
 }
 
 /// Parte un texto largo en trozos de hasta `max` caracteres, cortando de preferencia al final de
-/// una oracion y si no en un espacio.
+/// una oracion y si no en un espacio. Cada vuelta mira solo la ventana de `max` caracteres que
+/// sigue, asi el costo es lineal en el largo del texto.
 fn split_text(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
     let mut parts = Vec::new();
     let mut rest = text.trim();
-    while rest.chars().count() > max {
-        let limit = rest.char_indices().nth(max).map_or(rest.len(), |(i, _)| i);
+    while let Some((limit, _)) = rest.char_indices().nth(max) {
         let window = &rest[..limit];
-        let cut = window.rfind(". ").map(|i| i + 1).filter(|i| *i > limit / 3).or_else(|| window.rfind(' ').filter(|i| *i > limit / 3)).unwrap_or(limit);
+        let mut cut = window.rfind(". ").map(|i| i + 1).filter(|i| *i > limit / 3).or_else(|| window.rfind(' ').filter(|i| *i > limit / 3)).unwrap_or(limit);
+        cut = safe_cut(rest, cut);
         parts.push(rest[..cut].trim().to_string());
         rest = rest[cut..].trim_start();
     }
@@ -416,11 +577,44 @@ fn split_text(text: &str, max: usize) -> Vec<String> {
     parts
 }
 
+/// Corrige un corte que separaria un escape de su caracter ("\" | "<img") o partiria un "<br>":
+/// el corte retrocede hasta antes de la barra o del "<". Si asi quedaria vacio, avanza.
+fn safe_cut(text: &str, cut: usize) -> usize {
+    let before = &text[..cut];
+    let mut at = cut;
+    if let Some(i) = before.rfind('<').filter(|i| cut - i < 4 && text[*i..].starts_with("<br>")) {
+        at = i;
+    }
+    let slashes = text[..at].bytes().rev().take_while(|b| *b == b'\\').count();
+    if slashes % 2 == 1 {
+        at -= 1;
+    }
+    if text[..at].trim().is_empty() {
+        // Nada antes del escape: el corte pasa despues del caracter escapado o del "<br>".
+        let next = &text[at..];
+        let skip = if next.starts_with("<br>") { 4 } else { next.chars().take(2).map(char::len_utf8).sum::<usize>().min(next.len()) };
+        return (at + skip).max(cut).min(text.len());
+    }
+    at
+}
+
+/// Titulo para la ruta de un fragmento: en una linea y como mucho `MAX_PATH_CHARS` caracteres.
+fn path_title(t: &str) -> String {
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() <= MAX_PATH_CHARS {
+        return t;
+    }
+    let mut s: String = t.chars().take(MAX_PATH_CHARS - 1).collect();
+    s.truncate(s.trim_end().len());
+    s.push('…');
+    s
+}
+
 /// Corta el documento en fragmentos de hasta `max_chars` caracteres (minimo 200).
 pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
     let max = max_chars.max(MIN_CHUNK);
     let cx = context(d);
-    let mut b = Builder { max, out: Vec::new(), cur: Chunk::default(), prev: None, only_headings: false };
+    let mut b = Builder { max, out: Vec::new(), cur: Chunk::default(), chars: 0, prev: None, only_headings: false, tail: None };
     let mut path: Vec<(u8, String)> = Vec::new();
     let names = |p: &[(u8, String)]| p.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
     for blk in &d.content {
@@ -431,32 +625,39 @@ pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
         let len = md.chars().count();
         if let Some((level, title)) = section(blk) {
             // Un titulo abre fragmento nuevo, salvo que el actual sea muy corto (se juntan).
-            if b.cur.text.chars().count() >= MIN_CHUNK {
+            if b.chars >= MIN_CHUNK {
                 b.emit();
             }
             while path.last().is_some_and(|(l, _)| *l >= level) {
                 path.pop();
             }
-            path.push((level, title));
+            path.push((level, path_title(&title)));
             b.push(&md, Kind::Heading, blk.page, &names(&path));
             continue;
         }
         let here = names(&path);
-        let used = b.cur.text.chars().count();
-        if used > 0 && used + len + 2 > b.max && !(b.only_headings && len > b.max) {
-            b.emit();
+        if b.chars > 0 && b.chars + len + 2 > b.max && !b.only_headings {
+            // No cabe: el fragmento se cierra y los titulos con que termina pasan al siguiente.
+            b.close_before(&here);
         }
-        if len <= b.max {
+        let splittable = matches!(blk.kind, Kind::Paragraph | Kind::ListItem) || (blk.kind == Kind::Table && blk.rows.len() > 1);
+        if len <= b.max && (b.chars == 0 || b.chars + len + 2 <= b.max) {
             b.push(&md, blk.kind, blk.page, &here);
             continue;
         }
-        // Bloque mas grande que un fragmento: va en partes. Los titulos que lo preceden (si el
-        // fragmento en curso solo tiene titulos) quedan con la primera parte.
-        if !b.only_headings {
+        if len <= b.max && !splittable {
+            // Una imagen o una tabla de una fila que no cabe junto a sus titulos: los titulos van solos.
+            b.emit();
+            b.push(&md, blk.kind, blk.page, &here);
+            continue;
+        }
+        // Bloque que no cabe entero: va en partes. Los titulos que lo preceden (si el fragmento en
+        // curso solo tiene titulos) quedan con la primera parte.
+        if !b.only_headings || b.max.saturating_sub(b.chars + 2) < MIN_CHUNK / 2 {
             b.emit();
         }
         // Espacio que dejan los titulos que ya estan en el fragmento (solo para la primera parte).
-        let room = |b: &Builder| b.max.saturating_sub(b.cur.text.chars().count() + 2).max(MIN_CHUNK / 2);
+        let room = |b: &Builder| b.max.saturating_sub(b.chars + 2).max(MIN_CHUNK / 2);
         if blk.kind == Kind::Table && blk.rows.len() > 1 {
             let cells = table_cells(&blk.rows);
             let width = cells[0].len();
@@ -470,38 +671,41 @@ pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
             // Filas que caben en un fragmento junto al encabezado (las mas largas, repartidas).
             let lines: Vec<String> = body.iter().flat_map(|r| split_row(r, b.max.saturating_sub(head_len))).collect();
             let mut part = head.clone();
+            let mut part_len = head_len - 1;
             let mut limit = room(&b);
             for row in &lines {
-                let fits = part.chars().count() + row.chars().count() < limit;
-                if !fits && part == head && limit < b.max {
+                let row_len = row.chars().count();
+                let fits = part_len + row_len < limit;
+                if !fits && part_len == head_len - 1 && limit < b.max {
                     // Ni la primera fila cabe junto a los titulos: los titulos van solos.
                     b.emit();
                     limit = b.max;
                 }
-                if part.chars().count() + row.chars().count() + 1 > limit && part != head {
+                if part_len + row_len + 1 > limit && part_len != head_len - 1 {
                     b.push(&part, Kind::Table, blk.page, &here);
                     b.emit();
                     part = head.clone();
+                    part_len = head_len - 1;
                     limit = b.max;
                 }
                 part.push('\n');
                 part.push_str(row);
+                part_len += row_len + 1;
             }
             b.push(&part, Kind::Table, blk.page, &here);
             b.emit();
         } else {
-            let first = room(&b);
-            let pieces = split_text(&md, first);
-            let (head, rest) = pieces.split_first().map_or((None, &[][..]), |(h, r)| (Some(h), r));
-            if let Some(h) = head {
-                b.push(h, Kind::Paragraph, blk.page, &here);
-                b.emit();
-            }
-            // El resto se vuelve a partir con el tamano completo.
-            let rest = rest.join(" ");
-            for piece in split_text(&rest, b.max) {
-                b.push(&piece, Kind::Paragraph, blk.page, &here);
-                b.emit();
+            // Cada parte se escapa al inicio como una linea nueva (un corte puede dejar "# ..." o
+            // "1. ..." al comienzo), por eso se corta con un caracter de margen.
+            let pieces = split_text(&md, room(&b) - 1);
+            if let Some((head, rest)) = pieces.split_first() {
+                b.push(head, Kind::Paragraph, blk.page, &here);
+                // El resto se vuelve a partir con el tamano completo. La ultima parte queda abierta:
+                // los bloques que siguen se pueden juntar con ella.
+                for piece in split_text(&rest.join(" "), b.max - 1) {
+                    b.emit();
+                    b.push(&escape_start(&piece), Kind::Paragraph, blk.page, &here);
+                }
             }
         }
     }
@@ -509,8 +713,8 @@ pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
     let notes = notes_md(d);
     b.emit();
     if !notes.is_empty() {
-        for piece in split_text(&notes, b.max) {
-            b.push(&piece, Kind::Paragraph, None, &["Notas".to_string()]);
+        for piece in split_text(&notes, b.max - 1) {
+            b.push(&escape_start(&piece), Kind::Paragraph, None, &["Notas".to_string()]);
             b.emit();
         }
     }
@@ -607,7 +811,7 @@ mod tests {
             p("[2] no es una nota"),
         ]);
         d.extras.push(("footnotes", vec![Block { label: Some("1".into()), text: "Solo electricos.".into(), ..Block::default() }]));
-        assert_eq!(to_markdown(&d), "# Manual\n\n## Pasos\n\nAntes de partir.[^1]\n\n1. Detener\n  - Avisar\n- a) Bloquear\n\n[2] no es una nota\n\n[^1]: Solo electricos.\n");
+        assert_eq!(to_markdown(&d), "# Manual\n\n## Pasos\n\nAntes de partir.[^1]\n\n1. Detener\n  - Avisar\n- a) Bloquear\n\n\\[2\\] no es una nota\n\n[^1]: Solo electricos.\n");
     }
 
     #[test]
@@ -671,5 +875,89 @@ mod filas_largas {
         // No se pierde texto: todas las repeticiones de la oracion siguen estando.
         let total: usize = c.iter().map(|x| x.text.matches("Verificar el bloqueo").count()).sum();
         assert_eq!(total, 60);
+    }
+}
+
+#[cfg(test)]
+mod revision {
+    use super::*;
+    use std::time::Instant;
+
+    fn p(text: &str) -> Block {
+        Block { kind: Kind::Paragraph, text: text.into(), ..Block::default() }
+    }
+
+    fn h(level: u8, text: &str) -> Block {
+        Block { kind: Kind::Heading, level, text: text.into(), ..Block::default() }
+    }
+
+    fn una_celda(t: &str) -> Block {
+        Block { kind: Kind::Table, rows: vec![vec![Cell { text: t.into(), colspan: 1, rowspan: 1, merged: false }]], ..Block::default() }
+    }
+
+    fn doc(content: Vec<Block>) -> Document {
+        Document { kind: "docx", content, ..Document::default() }
+    }
+
+    #[test]
+    fn partir_un_texto_enorme_es_lineal() {
+        // 8 millones de caracteres en trozos de 200: cuadratico serian ~10^11 pasos.
+        let texto = "palabra ".repeat(1_000_000);
+        let inicio = Instant::now();
+        let partes = split_text(&texto, 200);
+        assert!(inicio.elapsed().as_secs() < 3, "{:?}", inicio.elapsed());
+        assert!(partes.iter().all(|p| p.chars().count() <= 200));
+        assert_eq!(partes.iter().map(|p| p.matches("palabra").count()).sum::<usize>(), 1_000_000);
+        // Tambien sin espacios y con caracteres de varios bytes.
+        let partes = split_text(&"ñ🦺".repeat(300_000), 150);
+        assert!(partes.iter().all(|p| p.chars().count() <= 150));
+        assert_eq!(partes.concat().chars().count(), 600_000);
+    }
+
+    #[test]
+    fn muchos_bloques_chicos_con_fragmentos_grandes_es_lineal() {
+        let content: Vec<Block> = (0..200_000).map(|i| p(&format!("Linea {}", i))).collect();
+        let inicio = Instant::now();
+        let c = chunks(&doc(content), 16_000_000);
+        assert!(inicio.elapsed().as_secs() < 3, "{:?}", inicio.elapsed());
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn la_ruta_acorta_los_titulos_largos() {
+        let largo = "Titulo muy largo ".repeat(500);
+        let c = chunks(&doc(vec![h(1, &largo), p("Texto de la seccion.")]), 20_000);
+        assert!(c[0].path[0].chars().count() <= MAX_PATH_CHARS, "{}", c[0].path[0].chars().count());
+        assert!(c[0].path[0].ends_with('…'));
+        // El titulo completo sigue en el texto del fragmento.
+        assert!(c[0].text.contains(largo.trim()));
+    }
+
+    #[test]
+    fn un_titulo_no_queda_al_final_de_un_fragmento() {
+        let corto = "Texto breve de la primera seccion.";
+        let largo = "Oracion de relleno para la seccion siguiente. ".repeat(21); // 966 caracteres
+        let d = doc(vec![h(1, "Primera"), p(corto), h(1, "Segunda"), h(2, "Detalle"), p(&largo)]);
+        let c = chunks(&d, 1000);
+        assert_eq!(c.len(), 2, "{:#?}", c);
+        assert!(!c[0].text.contains("Segunda"), "{:#?}", c);
+        assert!(c[1].text.starts_with("# Segunda\n\n## Detalle\n\nOracion"), "{:#?}", c);
+        assert_eq!(c[1].path, ["Segunda", "Detalle"]);
+        for x in &c {
+            let ultimo = x.text.rsplit("\n\n").next().unwrap();
+            assert!(!ultimo.starts_with('#'), "{:?}", x.text);
+        }
+    }
+
+    #[test]
+    fn un_recuadro_de_una_celda_no_es_titulo() {
+        for t in ["Use casco en todo momento", "Nota: revisar antes de partir", "Ver anexo"] {
+            let md = to_markdown(&doc(vec![una_celda(t), p("Texto")]));
+            assert_eq!(md, format!("| {} |\n| --- |\n\nTexto\n", t));
+        }
+        for (t, esperado) in [("3.2 RESPONSABLES", "## 3.2 RESPONSABLES"), ("1. Objetivo", "# 1. Objetivo"), ("OBJETIVO", "# OBJETIVO"), ("DEFINICIONES Y TÉRMINOS", "# DEFINICIONES Y TÉRMINOS")] {
+            let md = to_markdown(&doc(vec![una_celda(t), p("Texto")]));
+            assert_eq!(md, format!("{}\n\nTexto\n", esperado));
+        }
     }
 }

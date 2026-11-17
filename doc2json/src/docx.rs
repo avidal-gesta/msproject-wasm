@@ -608,7 +608,7 @@ impl<'a> Reader<'a> {
         }
         self.depth -= 1;
         // Combinaciones verticales: la celda que inicia recibe el alto total.
-        let col_of = |row: &Vec<CellTmp>, idx: usize| row.iter().take(idx).map(|c| c.colspan.max(1)).sum::<u32>();
+        let col_of = |row: &Vec<CellTmp>, idx: usize| row.iter().take(idx).fold(0u32, |n, c| n.saturating_add(c.colspan.max(1)));
         let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter().enumerate() {
             let mut cells = Vec::with_capacity(row.len());
@@ -641,7 +641,7 @@ impl<'a> Reader<'a> {
                         match ev {
                             Ev::End("w:tcPr") => break,
                             Ev::Start(p) => match p.name {
-                                "w:gridSpan" => c.colspan = p.attr("w:val").and_then(|v| v.parse().ok()).unwrap_or(1),
+                                "w:gridSpan" => c.colspan = p.attr("w:val").and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1).clamp(1, MAX_COLSPAN),
                                 "w:vMerge" => c.vmerge = Some(p.attr("w:val").as_deref() == Some("restart")),
                                 "w:tcPrChange" if !p.empty => x.skip("w:tcPrChange"),
                                 _ => {}

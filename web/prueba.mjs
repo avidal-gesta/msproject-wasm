@@ -95,6 +95,13 @@ comprobar('minSide omite los bytes de imagenes chicas', chicas.images[0].data ==
 const sinExtraer = await doc.docToJson(pdfConImagen());
 comprobar('sin images: lista sin bytes', sinExtraer.images.length === 1 && sinExtraer.images[0].data === undefined);
 comprobar('minSide invalido se rechaza', (await mensajeDeError(doc.docToJson(pdfConImagen(), { images: true, minSide: -1 }))) !== null);
+for (const malo of ['abc', NaN, 1.5, 0, '2000', 0x1000000]) {
+  comprobar(`docToChunks rechaza maxChars ${String(malo)}`, /maxChars/.test(await mensajeDeError(doc.docToChunks(new Uint8Array(4), { maxChars: malo }))));
+}
+{
+  const html = await doc.docToMarkdown(await readFile(path.join(ejemplo, 'procedimiento.docx')));
+  comprobar('docToMarkdown no deja etiquetas HTML del texto', !/<(?!br>|!-- pagina)/.test(html));
+}
 
 comprobar('doc2json rechaza un archivo que no es documento', /no reconocido/.test(await mensajeDeError(doc.docToJson(new TextEncoder().encode('hola mundo')))));
 comprobar('doc2json rechaza un archivo vacio', /vac/.test(await mensajeDeError(doc.docToJson(new Uint8Array(0)))));
