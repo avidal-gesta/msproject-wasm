@@ -4,6 +4,9 @@
 //! tabla de cadenas acotada a la ventana de 32 KB para que la memoria no crezca con la imagen.
 //! Cuando el PDF ya trae los pixeles comprimidos como un PNG (Flate con predictor PNG), se copian
 //! tal cual sin descomprimir ni volver a comprimir.
+//!
+//! `src/zip.rs` se ofrece tambien bajo MIT o Apache-2.0 (ver la seccion de licencia del README),
+//! por eso su compresor puede estar en doc2json.
 
 const fn crc_table() -> [u32; 256] {
     let mut table = [0u32; 256];
@@ -33,7 +36,7 @@ fn crc32(parts: &[&[u8]]) -> u32 {
     c ^ 0xFFFF_FFFF
 }
 
-fn adler32(data: &[u8]) -> u32 {
+pub(crate) fn adler32(data: &[u8]) -> u32 {
     let (mut a, mut b) = (1u32, 0u32);
     for chunk in data.chunks(5552) {
         for &x in chunk {
@@ -232,25 +235,31 @@ pub fn from_idat(spec: &Spec, idat: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Bytes por fila sin el byte de filtro.
-pub fn row_bytes(spec: &Spec) -> usize {
-    (spec.width as usize * spec.color.channels() * spec.depth as usize).div_ceil(8)
+/// Bytes por fila sin el byte de filtro. `None` si no caben en la memoria direccionable.
+pub fn row_bytes(spec: &Spec) -> Option<usize> {
+    let bits = (spec.width as u64).checked_mul(spec.color.channels() as u64)?.checked_mul(spec.depth as u64)?;
+    usize::try_from(bits.checked_add(7)? / 8).ok()
 }
 
 /// Arma el PNG a partir de los pixeles sin comprimir (filas consecutivas, sin byte de filtro).
 /// Con 8 o mas bits por muestra elige por fila el filtro que deja los valores mas chicos.
-pub fn encode(spec: &Spec, pixels: &[u8]) -> Vec<u8> {
-    let row = row_bytes(spec);
+/// `None` si los pixeles no cubren todas las filas declaradas: la memoria que se pide depende
+/// de los datos que llegan, no del tamano que declara `spec`.
+pub fn encode(spec: &Spec, pixels: &[u8]) -> Option<Vec<u8>> {
+    let row = row_bytes(spec)?;
     let height = spec.height as usize;
-    let bpp = (spec.color.channels() * spec.depth as usize).div_ceil(8);
+    if pixels.len() < row.checked_mul(height)? {
+        return None;
+    }
+    let bpp = (spec.color.channels() * spec.depth as usize + 7) / 8;
     let adaptive = spec.depth >= 8 && spec.color != Color::Palette;
     let mut filtered = Vec::with_capacity((row + 1) * height);
     let zero = vec![0u8; row];
     let mut candidate = vec![0u8; row];
     let mut best = vec![0u8; row];
     for y in 0..height {
-        let cur = pixels.get(y * row..(y + 1) * row).unwrap_or(&zero);
-        let up = if y == 0 { &zero[..] } else { pixels.get((y - 1) * row..y * row).unwrap_or(&zero) };
+        let cur = &pixels[y * row..(y + 1) * row];
+        let up = if y == 0 { &zero[..] } else { &pixels[(y - 1) * row..y * row] };
         if !adaptive {
             filtered.push(0);
             filtered.extend_from_slice(cur);
@@ -281,7 +290,7 @@ pub fn encode(spec: &Spec, pixels: &[u8]) -> Vec<u8> {
         filtered.push(best_kind);
         filtered.extend_from_slice(&best);
     }
-    from_idat(spec, &zlib(&filtered))
+    Some(from_idat(spec, &zlib(&filtered)))
 }
 
 fn paeth(a: u8, b: u8, c: u8) -> u8 {
@@ -307,7 +316,7 @@ mod tests {
         for i in 0..200_000u32 {
             d.push((i % 251) as u8 ^ (i / 7000) as u8);
         }
-        d.extend(std::iter::repeat_n(7u8, 100_000));
+        d.extend(std::iter::repeat(7u8).take(100_000));
         let z = zlib(&d);
         assert!(z.len() < d.len() / 3);
         assert_eq!(inflate(&z).data, d);
@@ -317,7 +326,7 @@ mod tests {
     fn png_valido() {
         let spec = Spec { width: 3, height: 2, depth: 8, color: Color::Rgb, palette: Vec::new() };
         let pixels = [255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30, 40, 50, 60, 70, 80, 90];
-        let png = encode(&spec, &pixels);
+        let png = encode(&spec, &pixels).unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(&png[12..16], b"IHDR");
         // Descomprime IDAT y deshace los filtros: deben volver los mismos pixeles.

@@ -4,21 +4,48 @@
 use crate::doc::{Image, Place};
 use std::collections::HashMap;
 
+/// Tope de imagenes distintas por documento: las siguientes no figuran en la lista.
+pub const MAX_IMAGES: usize = 10_000;
+/// Tope de lugares (veces que se dibujan) entre todas las imagenes del documento.
+pub const MAX_PLACES: usize = 100_000;
+/// Tope de bytes extraidos entre todas las imagenes del documento.
+pub const MAX_EXTRACTED: usize = 128 << 20;
+
 /// Imagenes del documento, una por archivo u objeto, en orden de aparicion.
-#[derive(Default)]
 pub struct ImageSet {
     pub list: Vec<Image>,
     /// Clave de cada imagen (ruta dentro del paquete u objeto de PDF), en el orden de `list`.
     pub keys: Vec<String>,
     index: HashMap<String, u32>,
+    places: usize,
+    max_images: usize,
+    max_places: usize,
+    /// Imagenes y lugares que no se registraron por los topes.
+    dropped_images: usize,
+    dropped_places: usize,
+}
+
+impl Default for ImageSet {
+    fn default() -> Self {
+        ImageSet::with_caps(MAX_IMAGES, MAX_PLACES)
+    }
 }
 
 impl ImageSet {
+    pub fn with_caps(max_images: usize, max_places: usize) -> Self {
+        ImageSet { list: Vec::new(), keys: Vec::new(), index: HashMap::new(), places: 0, max_images, max_places, dropped_images: 0, dropped_places: 0 }
+    }
+
     /// Devuelve el `id` de la imagen identificada por `key`; si es nueva, la crea con `make`.
-    /// Agrega el lugar y el texto alternativo si la imagen aun no tenia uno.
-    pub fn add(&mut self, key: &str, place: Option<Place>, alt: &str, make: impl FnOnce() -> Image) -> u32 {
+    /// Agrega el lugar y el texto alternativo si la imagen aun no tenia uno. `None` si es nueva
+    /// y ya se alcanzo el tope de imagenes.
+    pub fn add(&mut self, key: &str, place: Option<Place>, alt: &str, make: impl FnOnce() -> Image) -> Option<u32> {
         let id = match self.index.get(key) {
             Some(&id) => id,
+            None if self.list.len() >= self.max_images => {
+                self.dropped_images += 1;
+                return None;
+            }
             None => {
                 let id = self.list.len() as u32 + 1;
                 let mut img = make();
@@ -34,9 +61,80 @@ impl ImageSet {
             img.alt = alt.trim().to_string();
         }
         if let Some(p) = place {
-            img.places.push(p);
+            if self.places < self.max_places {
+                self.places += 1;
+                img.places.push(p);
+            } else {
+                self.dropped_places += 1;
+            }
         }
-        id
+        Some(id)
+    }
+
+    /// Avisos por lo que no se registro al llegar a los topes.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.dropped_images > 0 {
+            out.push(format!("El documento tiene mas de {} imagenes distintas: las siguientes no figuran en la lista.", self.max_images));
+        }
+        if self.dropped_places > 0 {
+            out.push(format!("Las imagenes se dibujan mas de {} veces: {} lugares no figuran en la lista.", self.max_places, self.dropped_places));
+        }
+        out
+    }
+}
+
+/// Clave de una parte de un paquete ZIP para reconocer la misma imagen: sin la barra inicial y
+/// sin distinguir mayusculas, igual que `ZipArchive::find`.
+pub fn part_key(path: &str) -> String {
+    path.trim_start_matches('/').to_ascii_lowercase()
+}
+
+/// Bytes extraidos entre todas las imagenes de un documento, con su tope.
+pub struct Budget {
+    used: usize,
+    limit: usize,
+    skipped: usize,
+}
+
+impl Budget {
+    pub fn new(limit: usize) -> Self {
+        Budget { used: 0, limit, skipped: 0 }
+    }
+
+    /// Ya no cabe nada mas: las imagenes que faltan no se leen.
+    pub fn exhausted(&self) -> bool {
+        self.used >= self.limit
+    }
+
+    /// Entrega los bytes en la imagen si caben en el tope; si no, deja una nota.
+    pub fn store(&mut self, img: &mut Image, data: Vec<u8>) {
+        match self.used.checked_add(data.len()) {
+            Some(total) if total <= self.limit => {
+                self.used = total;
+                img.data = Some(data);
+            }
+            _ => self.skip(img),
+        }
+    }
+
+    /// La imagen no se extrae por el tope.
+    pub fn skip(&mut self, img: &mut Image) {
+        self.skipped += 1;
+        img.data = None;
+        img.note = Some(format!("No se extrae: se alcanzo el tope de {} de imagenes por documento.", mb(self.limit)));
+    }
+
+    pub fn warning(&self) -> Option<String> {
+        (self.skipped > 0).then(|| format!("{} imagenes no se extrajeron: superan el tope de {} por documento.", self.skipped, mb(self.limit)))
+    }
+}
+
+fn mb(bytes: usize) -> String {
+    if bytes >= 1 << 20 {
+        format!("{} MB", bytes >> 20)
+    } else {
+        format!("{} bytes", bytes)
     }
 }
 
@@ -191,8 +289,34 @@ mod tests {
         let a = set.add("media/a.png", Some(Place { w: 10.0, h: 5.0, ..Place::default() }), "", make);
         let b = set.add("media/b.png", None, "logo", make);
         let a2 = set.add("media/a.png", Some(Place { w: 20.0, h: 10.0, ..Place::default() }), "grafico", make);
-        assert_eq!((a, b, a2), (1, 2, 1));
+        assert_eq!((a, b, a2), (Some(1), Some(2), Some(1)));
         assert_eq!(set.list[0].places.len(), 2);
         assert_eq!(set.list[0].alt, "grafico");
+        assert!(set.warnings().is_empty());
+    }
+
+    #[test]
+    fn topes_de_imagenes_lugares_y_bytes() {
+        let mut set = ImageSet::with_caps(2, 3);
+        let make = Image::default;
+        let p = || Some(Place::default());
+        assert_eq!(set.add("a", p(), "", make), Some(1));
+        assert_eq!(set.add("b", p(), "", make), Some(2));
+        assert_eq!(set.add("c", p(), "", make), None);
+        assert_eq!(set.add("a", p(), "", make), Some(1));
+        assert_eq!(set.add("a", p(), "", make), Some(1));
+        assert_eq!((set.list.len(), set.list[0].places.len()), (2, 2));
+        assert_eq!(set.warnings().len(), 2);
+
+        let mut budget = Budget::new(10);
+        let (mut x, mut y, mut z) = (Image::default(), Image::default(), Image::default());
+        budget.store(&mut x, vec![0; 6]);
+        budget.store(&mut y, vec![0; 6]);
+        budget.store(&mut z, vec![0; 4]);
+        assert_eq!((x.data.is_some(), y.data.is_some(), z.data.is_some()), (true, false, true));
+        assert!(y.note.as_deref().unwrap().contains("tope"));
+        assert!(budget.exhausted());
+        assert!(budget.warning().unwrap().starts_with("1 imagenes"));
+        assert_eq!(part_key("/word/MEDIA/Image1.PNG"), part_key("word/media/image1.png"));
     }
 }

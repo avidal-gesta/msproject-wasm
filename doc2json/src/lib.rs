@@ -115,12 +115,12 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
 /// `warnings`. Si el presupuesto de descompresion se agota antes de llegar al contenido, falla
 /// con un error que lo dice (en vez del error generico del lector).
 pub fn read_with_limits(bytes: &[u8], limits: budget::Limits) -> Result<Document, String> {
-    read_with_options(bytes, limits, false)
+    read_with_options(bytes, limits, None)
 }
 
 /// Como `read_with_limits`; con `images` extrae ademas los bytes de cada imagen de
 /// `Document::images` (en `data`, o el motivo por el que no, en `note`).
-pub fn read_with_options(bytes: &[u8], limits: budget::Limits, images: bool) -> Result<Document, String> {
+pub fn read_with_options(bytes: &[u8], limits: budget::Limits, images: Option<usize>) -> Result<Document, String> {
     let format = detect(bytes)?;
     budget::begin(limits);
     let result = match format {
@@ -205,9 +205,16 @@ fn limit_blocks(blocks: &mut Vec<doc::Block>, left: &mut usize) -> bool {
 }
 
 /// Lee un documento y extrae ademas sus imagenes: cada una de `Document::images` trae sus
-/// bytes en `data` (o el motivo por el que no, en `note`).
+/// bytes en `data` (o el motivo por el que no, en `note`). Entre todas suman a lo sumo
+/// `image::MAX_EXTRACTED` bytes (128 MB); las que no caben quedan con una nota y un aviso.
 pub fn read_with_images(bytes: &[u8]) -> Result<Document, String> {
-    read_with_options(bytes, budget::Limits::default(), true)
+    read_with_image_budget(bytes, image::MAX_EXTRACTED)
+}
+
+/// Como `read_with_images`, con otro tope de bytes entre todas las imagenes (por ejemplo, uno
+/// menor donde hay poca memoria).
+pub fn read_with_image_budget(bytes: &[u8], max_bytes: usize) -> Result<Document, String> {
+    read_with_options(bytes, budget::Limits::default(), Some(max_bytes))
 }
 
 /// Convierte un documento a JSON. Con `full` se incluyen estilos, formato de los tramos de

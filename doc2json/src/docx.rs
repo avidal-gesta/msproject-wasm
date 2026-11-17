@@ -4,7 +4,7 @@
 //! numeracion de listas, las notas, encabezados y pies, y las propiedades del documento.
 
 use crate::doc::*;
-use crate::image::{describe, format_from_name, ImageSet};
+use crate::image::{describe, format_from_name, part_key, Budget, ImageSet};
 use crate::symbols::{classify, translate_str, SymbolFont};
 use crate::xml::{Ev, Tag, Xml};
 use crate::zipread::ZipArchive;
@@ -67,7 +67,8 @@ struct Reader<'a> {
     styles: HashMap<String, Style>,
     abstracts: HashMap<String, Vec<Level>>,
     nums: HashMap<u32, Num>,
-    rels: HashMap<String, String>,
+    /// Relaciones de la parte en curso: destino y si es externo (`TargetMode="External"`).
+    rels: HashMap<String, (String, bool)>,
     /// Contadores de numeracion por lista; -1 = nivel aun sin usar.
     counters: HashMap<u32, [i64; 9]>,
     /// Numero visible de cada nota (segun el orden en que se citan): (es_final, id) -> n.
@@ -452,7 +453,7 @@ impl<'a> Reader<'a> {
         let mut fmt = RunFmt::default();
         let mut in_run = false;
         let mut link: Option<String> = None;
-        let mut images: Vec<(String, String, u32)> = Vec::new();
+        let mut images: Vec<(String, String, Option<u32>)> = Vec::new();
         let mut alt = String::new();
         let mut nested: Vec<Block> = Vec::new();
         let mut page_break = false;
@@ -514,7 +515,7 @@ impl<'a> Reader<'a> {
                         }
                     }
                     "w:hyperlink" => {
-                        link = t.attr("r:id").and_then(|id| self.rels.get(&id).cloned()).or_else(|| t.attr("w:anchor").map(|a| format!("#{}", a)));
+                        link = t.attr("r:id").and_then(|id| self.rels.get(&id).map(|(target, _)| target.clone())).or_else(|| t.attr("w:anchor").map(|a| format!("#{}", a)));
                     }
                     "w:footnoteReference" => {
                         let n = self.note_number(false, t.attr("w:id"));
@@ -537,11 +538,14 @@ impl<'a> Reader<'a> {
                     }
                     "wp:docPr" => alt = t.attr("descr").or_else(|| t.attr("title")).unwrap_or_default(),
                     "a:blip" | "v:imagedata" => {
-                        if let Some(target) = t.attr("r:embed").or_else(|| t.attr("r:id")).and_then(|id| self.rels.get(&id).cloned()) {
+                        if let Some((target, external)) = t.attr("r:embed").or_else(|| t.attr("r:id")).and_then(|id| self.rels.get(&id).cloned()) {
                             let name = target.rsplit('/').next().unwrap_or(&target).to_string();
                             let place = self.extent.take().map(|(w, h)| Place { w, h, ..Place::default() });
                             let alt = std::mem::take(&mut alt);
-                            let id = self.images.add(&target, place, &alt, || Image { format: format_from_name(&target), name: Some(name.clone()), ..Image::default() });
+                            // La misma parte se reconoce aunque cambien las mayusculas (como la busca
+                            // el lector ZIP); una vinculada no es una parte del paquete.
+                            let key = image_key(&target, external);
+                            let id = self.images.add(&key, place, &alt, || Image { format: format_from_name(&target), name: Some(name.clone()), ..Image::default() });
                             images.push((name, alt, id));
                         }
                     }
@@ -580,7 +584,7 @@ impl<'a> Reader<'a> {
             out.push(b);
         }
         for (name, alt, id) in images {
-            out.push(Block { kind: Kind::Image, name: Some(name), text: alt, image: Some(id), ..Block::default() });
+            out.push(Block { kind: Kind::Image, name: Some(name), text: alt, image: id, ..Block::default() });
         }
         out.append(&mut nested);
         if page_break {
@@ -769,14 +773,17 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(crate) fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, String> {
+pub(crate) fn part_rels(zip: &ZipArchive, part: &str) -> HashMap<String, (String, bool)> {
     let (dir, file) = match part.rfind('/') {
         Some(i) => (&part[..i], &part[i + 1..]),
         None => ("", part),
     };
     let rels_path = if dir.is_empty() { format!("_rels/{}.rels", file) } else { format!("{}/_rels/{}.rels", dir, file) };
-    relationships(zip, &rels_path).into_iter().map(|(id, _, target, external)| (id, if external { target } else { resolve(dir, &target) })).collect()
+    relationships(zip, &rels_path).into_iter().map(|(id, _, target, external)| (id, (if external { target } else { resolve(dir, &target) }, external))).collect()
 }
+
+/// Prefijo de la clave de las imagenes vinculadas (fuera del paquete): no se leen del ZIP.
+pub(crate) const LINKED: &str = "vinculada:";
 
 /// Propiedades del documento (docProps/core.xml y app.xml).
 pub(crate) fn properties(zip: &ZipArchive, doc: &mut Document) {
@@ -818,11 +825,12 @@ pub(crate) fn properties(zip: &ZipArchive, doc: &mut Document) {
 }
 
 pub fn read(data: &[u8]) -> Result<Document, String> {
-    read_opts(data, false)
+    read_opts(data, None)
 }
 
-/// Lee el documento; con `images` agrega los bytes de cada imagen y su tamano en pixeles.
-pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
+/// Lee el documento; con `images` (tope de bytes entre todas las imagenes) agrega los bytes de
+/// cada imagen y su tamano en pixeles.
+pub fn read_opts(data: &[u8], images: Option<usize>) -> Result<Document, String> {
     let zip = ZipArchive::open(data).map_err(|_| "El archivo no es un .docx valido (no es un ZIP).".to_string())?;
 
     // La parte principal se declara en las relaciones del paquete.
@@ -862,7 +870,7 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
     for (id, kind, target, external) in relationships(&zip, &rels_path) {
         let path = if external { target } else { resolve(&r.dir, &target) };
         parts.entry(kind).or_default().push(path.clone());
-        r.rels.insert(id, path);
+        r.rels.insert(id, (path, external));
     }
     let first = |k: &str, default: &str| parts.get(k).and_then(|v| v.first().cloned()).unwrap_or_else(|| resolve(&dir, default));
     // El cuerpo se descomprime antes que estilos y numeracion: si un archivo agota el presupuesto
@@ -915,24 +923,48 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
 
     // Las imagenes de encabezados y pies figuran en la lista aunque esos bloques salgan como texto.
     let set = std::mem::take(&mut r.images);
+    doc.warnings.extend(set.warnings());
     doc.images = set.list;
-    if images {
-        extract_images(&zip, &mut doc.images, &set.keys);
+    if let Some(limit) = images {
+        doc.warnings.extend(extract_images(&zip, &mut doc.images, &set.keys, limit));
     }
     Ok(doc)
 }
 
-/// Bytes de las imagenes de un paquete Office: cada clave es la ruta de la parte en el ZIP (o
-/// la direccion de una imagen vinculada, que no se descarga).
-pub(crate) fn extract_images(zip: &ZipArchive, images: &mut [Image], keys: &[String]) {
-    for (img, path) in images.iter_mut().zip(keys) {
-        match zip.read(path) {
+/// Bytes de las imagenes de un paquete Office (Word, PowerPoint y Excel), con `limit` bytes entre
+/// todas: cada clave es la ruta de la parte en el ZIP (`part_key`) o, con el prefijo `LINKED`, la
+/// direccion de una imagen vinculada, que no se lee. Devuelve el aviso si el tope dejo imagenes
+/// fuera.
+pub(crate) fn extract_images(zip: &ZipArchive, images: &mut [Image], keys: &[String], limit: usize) -> Option<String> {
+    let mut budget = Budget::new(limit);
+    for (img, key) in images.iter_mut().zip(keys) {
+        if key.starts_with(LINKED) {
+            img.note = Some("Imagen vinculada desde fuera del documento.".into());
+            continue;
+        }
+        // El tamano que declara el ZIP permite saltarse una imagen que no cabe sin descomprimirla.
+        if budget.exhausted() || zip.find(key).map_or(false, |e| e.size > limit) {
+            budget.skip(img);
+            continue;
+        }
+        match zip.read(key) {
             Some(bytes) => {
                 describe(img, &bytes);
-                img.data = Some(bytes);
+                budget.store(img, bytes);
             }
-            None => img.note = Some(if path.contains("://") { "Imagen vinculada desde fuera del documento.".into() } else { "No se pudo leer el archivo de la imagen.".into() }),
+            None => img.note = Some("No se pudo leer el archivo de la imagen.".into()),
         }
+    }
+    budget.warning()
+}
+
+/// Clave de una imagen en la lista comun: la parte del paquete (sin distinguir mayusculas, como
+/// la busca el lector ZIP) o, si es vinculada, su direccion con el prefijo `LINKED`.
+pub(crate) fn image_key(target: &str, external: bool) -> String {
+    if external {
+        format!("{}{}", LINKED, target)
+    } else {
+        part_key(target)
     }
 }
 

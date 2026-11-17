@@ -204,7 +204,7 @@ export interface DocImage {
   mime?: string;
   size?: number;
   data?: Uint8Array;
-  /** Por que no se entrega el archivo (JBIG2, espacio de color no soportado, demasiado grande...). */
+  /** Por que no se entrega el archivo (JBIG2, espacio de color no soportado, demasiado grande, datos incompletos, tope de 128 MB por documento...). */
   note?: string;
 }
 

@@ -5,7 +5,7 @@ Dos herramientas independientes, escritas en **Rust sin ninguna dependencia**, q
 | Herramienta | Entrada | Salida | Ejecutable | WebAssembly |
 |---|---|---|---|---|
 | **mpp2xlsx** | Microsoft Project (`.mpp`) | Excel (`.xlsx`) con Gantt, y JSON | 569 KB | 339 KB (93 KB con brotli) |
-| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado, Markdown y fragmentos, e imágenes | 738 KB | 651 KB (203 KB con brotli) |
+| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado, Markdown y fragmentos, e imágenes | 775 KB | 690 KB (209 KB con brotli) |
 
 No necesitan Microsoft Project, Office, Java ni conexión a internet. Todo el código que lee los formatos es propio: contenedor OLE2, formato MPP, ZIP, DEFLATE, XML, PDF y sus cifrados.
 
@@ -208,7 +208,16 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 | PDF con fax (CCITTFaxDecode, grupos 3 y 4) o JBIG2 | PNG de un bit, decodificado: escaneos en blanco y negro listos para OCR o para un modelo de visión. Un fax que no se puede decodificar se entrega tal cual, en un TIFF. |
 | PDF con píxeles (Flate, LZW, RunLength o sin comprimir) | PNG: gris, RGB, CMYK (convertido a RGB), indexado con su paleta, tinta plana y máscaras de un bit, con transparencia si traen máscara suave del mismo tamaño (también la premezclada con `/Matte`). Si los datos ya son un PNG por dentro (Flate con predictor PNG), se copian sin recomprimir. |
 
-No se convierten, y figuran con `note`: JBIG2 con codificación Huffman, semitonos o regiones intermedias (no aparecieron en más de mil imágenes JBIG2 reales), espacios de color Lab o DeviceN de varias tintas, e imágenes de más de 25 millones de píxeles (100 millones si son de un bit, como los escaneos). Las imágenes incrustadas en el contenido de la página (`BI … EI`, poco comunes) se cuentan pero no se extraen.
+No se convierten, y figuran con `note`: JBIG2 con codificación Huffman, semitonos, regiones intermedias, plantilla extendida (`EXTTEMPLATE`) o diccionarios que reutilizan los contextos de otro (no aparecieron en más de mil imágenes JBIG2 reales), fax o JBIG2 cuyos tamaños declarados pasan los topes, espacios de color Lab o DeviceN de varias tintas, e imágenes de más de 25 millones de píxeles (100 millones si son de un bit, como los escaneos). Las imágenes incrustadas en el contenido de la página (`BI … EI`, poco comunes) se cuentan pero no se extraen.
+
+**Topes y archivos dañados.** La memoria que pide una imagen depende de los datos que trae, no del tamaño que declara:
+
+- Si a los datos de una imagen de PDF les falta más de la mitad de lo que su tamaño exige, no se extrae (`note`: datos incompletos); si falta menos (un escaneo cortado), se completa con ceros. Una máscara suave sin datos suficientes se ignora.
+- Los datos con predictor PNG se copian sin recomprimir solo si un lector estricto los aceptaría (zlib con su suma Adler-32, filas completas, filtros 0 a 4); si no, se decodifican y se vuelven a comprimir. Las paletas se completan en negro hasta cubrir todos los índices posibles.
+- Por documento: a lo sumo 10.000 imágenes distintas en `images`, 100.000 lugares entre todas y 128 MB extraídos (`doc2json::read_with_image_budget` en Rust acepta otro tope). Lo que pasa de ahí queda fuera o con `note`, y con un aviso en `warnings`.
+- La misma imagen se reconoce aunque la citen de otra forma: en PDF por el número de objeto (sin la generación, que no cambia lo que se lee); en Word por la ruta de la parte sin distinguir mayúsculas. Las imágenes vinculadas (`TargetMode="External"`) no se leen del paquete aunque su destino se parezca a una parte de él.
+
+**Protocolo del `.wasm`.** `doc_convert(ptr, n, modo)`: el byte bajo de `modo` es la operación y los bits 8 a 31 su parámetro, un reparto común a todas las salidas: 0 JSON, 1 JSON completo, 2 Markdown, 3 fragmentos (parámetro: tamaño máximo en caracteres), 4 JSON con imágenes y 5 JSON completo con imágenes (parámetro: lado mínimo). Este módulo implementa 0, 1, 4 y 5; cualquier otra operación da el error «Modo de conversion desconocido.».
 
 ---
 
@@ -524,7 +533,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - 300 PDF reales con imágenes (8.812 imágenes): se extraen 8.807 (las otras 5 pasan de 25 millones de píxeles) y todas abren en Pillow con el tamaño declarado (3.520 JPEG, 5.162 PNG, 125 TIFF). De los PNG comparables con el mapa de píxeles de PyMuPDF, 3.336 de 3.338 difieren en a lo sumo 1 nivel por canal; los otros 2 usan perfiles ICC, que PyMuPDF aplica y aquí no.
 - Lugares: 54.044 contra 54.230 de PyMuPDF; en páginas sin girar, el 98,8 % coincide con su rectángulo con menos de 1,5 puntos de diferencia.
 - 200 Word reales (10.426 imágenes): los bytes extraídos son idénticos a los del archivo incrustado en todos los casos, y el 98,3 % queda citado desde un bloque o una celda (el resto está en encabezados y pies).
-- Escaneos en fax y JBIG2 (84 y 7 PDF reales): las 3.780 imágenes de fax y las 1.092 JBIG2 comparadas son idénticas píxel a píxel a las de PyMuPDF; solo quedan fuera 15 planos de más de 100 millones de píxeles. Además, 354 imágenes armadas para cubrir todos los largos de corrida y texto, codificadas en grupos 3 y 4 por libtiff, se decodifican idénticas. Mediana de 15 ms por imagen de fax y 154 ms por página JBIG2.
+- Escaneos en fax y JBIG2 (122 y 7 PDF reales): las 5.415 imágenes de fax y las 1.092 JBIG2 comparadas son idénticas píxel a píxel a las de PyMuPDF; solo quedan fuera 19 planos de más de 100 millones de píxeles. Además, 354 imágenes armadas para cubrir todos los largos de corrida y texto, codificadas en grupos 3 y 4 por libtiff, se decodifican idénticas. Mediana de 104 ms por documento.
 
 **Resistencia**
 
@@ -532,6 +541,8 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - 162 presentaciones y 1.003 planillas reales: ningún fallo ni cuelgue; mediana de 39 ms por presentación y 16 ms por planilla. Los únicos errores fueron archivos de bloqueo de Office y uno truncado, con un mensaje claro.
 - 460 archivos dañados a propósito (truncados, con bytes alterados, con tramos borrados): todos terminan en lectura parcial o en un error claro.
 - Archivos "bomba" armados en `doc2json/tests/presupuesto.rs` (un `.docx` de ~250 KB que descomprime 40 MB, otro con la bomba en los estilos o antes del cuerpo, un PDF con un flujo que descomprime 30 MB, seis flujos que solo juntos pasan el límite, flujos LZW, ASCII85, RunLength y cadenas de filtros, un flujo de objetos, un PDF de 50 páginas): se cortan en el límite pedido con su aviso, sin afectar a la lectura siguiente.
+- Fax y JBIG2: la memoria se reserva según los tamaños declarados en el archivo, así que se acotan antes (fax: hasta 2²⁰ columnas y 200 millones de píxeles; JBIG2: hasta 2²⁰ símbolos, y un presupuesto de píxeles y de cálculo proporcional al tamaño de la página). Las cuentas con datos del archivo se hacen en 64 bits o con tope, para que en wasm32 no desborden. Las pruebas incluyen cabeceras armadas para cada caso y miles de flujos alterados al azar, sin fallos y en menos de 2 s cada uno.
+- Imágenes fabricadas para agotar la memoria (un diccionario de 1 MB dibujado 400 veces, 5.000 × 5.000 píxeles declarados con 150 bytes, máscaras y paletas cortas, PNG por dentro con filtros o sumas inválidas, la misma imagen citada con otra generación o con otras mayúsculas): `tests/imagenes_memoria.rs` mide la memoria con un asignador que cuenta, y `tests/imagenes.rs` el resultado.
 - En todas las herramientas, el archivo generado en el navegador es idéntico byte a byte al del ejecutable.
 
 Los scripts de comparación y los archivos con que se hizo esta validación no forman parte de este repositorio.
@@ -554,7 +565,7 @@ doc2json/src/           doc2json
   xlsx.rs               lector de Excel: textos compartidos, formatos de fecha, combinaciones
   image.rs  png.rs      lista de imágenes, formato por cabecera y escritor PNG
   ccitt.rs              fax CCITT grupos 3 y 4 (T.4 y T.6), también el modo MMR de JBIG2
-  jbig2.rs              JBIG2 (T.88): decodificador aritmético, regiones genéricas, de texto y refinamiento
+  jbig2.rs              JBIG2 (T.88): decodificador aritmético MQ (anexo E), regiones genéricas, de texto y refinamiento
   pdf/
     object.rs           objetos de PDF y su analizador
     document.rs         tabla de referencias, objetos, páginas, metadatos

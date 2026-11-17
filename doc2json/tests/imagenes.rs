@@ -114,8 +114,8 @@ fn decode_png(p: &[u8]) -> (u32, u32, u8, u8, Vec<u8>, Vec<u8>) {
         2 => 3,
         _ => 4,
     };
-    let row = (w as usize * channels * depth as usize).div_ceil(8);
-    let bpp = (channels * depth as usize).div_ceil(8);
+    let row = (w as usize * channels * depth as usize + 7) / 8;
+    let bpp = (channels * depth as usize + 7) / 8;
     let raw = doc2json::inflate::zlib(&idat).data;
     let mut out: Vec<u8> = Vec::new();
     let mut prev = vec![0u8; row];
@@ -351,8 +351,8 @@ fn docx_con_imagenes(png_bytes: &[u8], logo: &[u8]) -> Vec<u8> {
 
 #[test]
 fn word_lista_bloques_y_extraccion() {
-    let img = png::encode(&Spec { width: 4, height: 3, depth: 8, color: Color::Gray, palette: Vec::new() }, &[7; 12]);
-    let logo = png::encode(&Spec { width: 1, height: 1, depth: 8, color: Color::Rgb, palette: Vec::new() }, &[1, 2, 3]);
+    let img = png::encode(&Spec { width: 4, height: 3, depth: 8, color: Color::Gray, palette: Vec::new() }, &[7; 12]).unwrap();
+    let logo = png::encode(&Spec { width: 1, height: 1, depth: 8, color: Color::Rgb, palette: Vec::new() }, &[1, 2, 3]).unwrap();
     let bytes = docx_con_imagenes(&img, &logo);
 
     let d = read(&bytes).unwrap();
@@ -421,4 +421,314 @@ fn ejemplos_sin_imagenes_no_cambian() {
         let expected = std::fs::read_to_string(format!("{}.json", path)).unwrap();
         assert_eq!(doc2json::doc::to_json(&d, false), expected);
     }
+}
+
+#[test]
+fn pdf_fax_y_jbig2_con_tamanos_fuera_de_rango() {
+    // /Columns enormes: en wasm32, 2^31 columnas por 16 filas daba un arreglo de 0 bytes y la
+    // primera fila caia fuera; un valor de mas de 32 bits se truncaba. Ahora quedan con una nota.
+    // /Rows mayor que el alto de la imagen no hace decodificar filas de mas. El JBIG2 es un
+    // segmento de 11 bytes con largo 0xFFFFFFFE, que en wasm32 desbordaba.
+    let fax = |columns: &str, rows: &str| {
+        stream(&format!("/Subtype /Image /Width 8 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 {} {} >>", columns, rows), &[0xFF, 0xFF])
+    };
+    let bytes = pdf(&[
+        obj("<< /Type /Catalog /Pages 2 0 R >>"),
+        obj("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>"),
+        obj("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R /Im2 6 0 R /Im3 7 0 R /Im4 8 0 R >> >> >>"),
+        stream("", b"q 8 0 0 16 0 0 cm /Im1 Do Q q 8 0 0 16 20 0 cm /Im2 Do Q q 8 0 0 16 40 0 cm /Im3 Do Q q 8 0 0 8 60 0 cm /Im4 Do Q"),
+        fax("/Columns 2147483648", ""),
+        fax("/Columns 99999999999999", ""),
+        fax("", "/Rows 99999999999"),
+        stream("/Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode", &[0, 0, 0, 0, 48, 0, 1, 0xFF, 0xFF, 0xFF, 0xFE]),
+    ]);
+    let d = read_with_images(&bytes).unwrap();
+    for id in [1, 2] {
+        assert!(image(&d, id).data.is_none());
+        assert!(image(&d, id).note.as_deref().unwrap_or("").contains("demasiado grande"), "{:?}", image(&d, id).note);
+    }
+    let (w, h, _, _, _, _) = decode_png(image(&d, 3).data.as_deref().unwrap());
+    assert_eq!((w, h), (8, 16));
+    let (w, h, _, _, _, px) = decode_png(image(&d, 4).data.as_deref().unwrap());
+    assert_eq!((w, h, px), (8, 8, vec![0xFF; 8]));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Archivos danados o fabricados
+// ---------------------------------------------------------------------------------------------
+
+/// PDF de una pagina que dibuja las imagenes dadas (objetos desde el 5) con `content`.
+fn pdf_con(resources: &str, content: &str, images: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut objs = vec![
+        obj("<< /Type /Catalog /Pages 2 0 R >>"),
+        obj("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>"),
+        obj(&format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << {} >> >> >>", resources)),
+        stream("", content.as_bytes()),
+    ];
+    objs.extend(images);
+    pdf(&objs)
+}
+
+#[test]
+fn pdf_misma_imagen_con_otra_generacion_no_se_repite() {
+    // `5 0 R` y `5 1 R` llevan al mismo objeto (la generacion no cambia lo que se lee).
+    let bytes = pdf_con(
+        "/Im1 5 0 R /Im2 5 1 R",
+        "q 10 0 0 10 0 0 cm /Im1 Do Q q 20 0 0 20 50 50 cm /Im2 Do Q",
+        vec![stream("/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[9])],
+    );
+    let d = read(&bytes).unwrap();
+    assert_eq!(d.images.len(), 1);
+    assert_eq!(d.images[0].places.len(), 2);
+}
+
+#[test]
+fn pdf_paleta_mas_corta_que_los_indices() {
+    // Paleta de 2 entradas con 2 bits por muestra: los indices 2 y 3 no tienen color. El PNG debe
+    // seguir siendo valido: cada indice posible tiene su entrada (negro si la paleta no la trae).
+    let bytes = pdf_con(
+        "/Im1 5 0 R",
+        "q 10 0 0 10 0 0 cm /Im1 Do Q",
+        vec![stream("/Subtype /Image /Width 4 /Height 1 /ColorSpace [/Indexed /DeviceRGB 1 <FF0000 00FF00>] /BitsPerComponent 2", &[0b0001_1011])],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    let png = d.images[0].data.clone().unwrap_or_else(|| panic!("sin datos: {:?}", d.images[0].note));
+    let (_, _, depth, color, plte, px) = decode_png(&png);
+    assert_eq!((depth, color, px), (2, 3, vec![0b0001_1011]));
+    assert_eq!(plte.len(), 4 * 3, "una entrada por cada indice posible");
+    assert_eq!(&plte[..6], &[255, 0, 0, 0, 255, 0]);
+    // Paleta que declara mas entradas de las que trae: las que faltan quedan en negro.
+    let bytes = pdf_con(
+        "/Im1 5 0 R",
+        "q 10 0 0 10 0 0 cm /Im1 Do Q",
+        vec![stream("/Subtype /Image /Width 2 /Height 1 /ColorSpace [/Indexed /DeviceRGB 255 <FFFFFF>] /BitsPerComponent 8", &[0, 200])],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    let (_, _, _, _, plte, px) = decode_png(d.images[0].data.as_deref().unwrap());
+    assert_eq!(px, [0, 200]);
+    assert_eq!((&plte[..3], &plte[600..603]), (&[255u8, 255, 255][..], &[0u8, 0, 0][..]));
+}
+
+#[test]
+fn pdf_cmyk_pasa_a_rgb() {
+    let bytes = pdf_con(
+        "/Im1 5 0 R /Im2 6 0 R",
+        "q 10 0 0 10 0 0 cm /Im1 Do Q q 10 0 0 10 20 0 cm /Im2 Do Q",
+        vec![
+            stream("/Subtype /Image /Width 3 /Height 1 /ColorSpace /DeviceCMYK /BitsPerComponent 8", &[0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 255]),
+            // Con /Decode [1 0 ...] (Photoshop guarda asi el CMYK de los JPEG) los valores se invierten.
+            stream("/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Decode [1 0 1 0 1 0 1 0]", &[255, 255, 255, 255]),
+        ],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    let (_, _, depth, color, _, px) = decode_png(d.images[0].data.as_deref().unwrap());
+    assert_eq!((depth, color), (8, 2));
+    assert_eq!(px, [255, 255, 255, 0, 255, 255, 0, 0, 0]);
+    let (_, _, _, _, _, px) = decode_png(d.images[1].data.as_deref().unwrap());
+    assert_eq!(px, [255, 255, 255]);
+}
+
+#[test]
+fn pdf_tamano_declarado_mayor_que_los_datos() {
+    let bytes = pdf_con(
+        "/Im1 5 0 R /Im2 6 0 R /Im3 7 0 R",
+        "q 10 0 0 10 0 0 cm /Im1 Do Q q 10 0 0 10 20 0 cm /Im2 Do Q q 10 0 0 10 40 0 cm /Im3 Do Q",
+        vec![
+            // 4.000 x 4.000 en RGB declarados con 12 bytes: no se arma un PNG de 48 MB de relleno.
+            stream("/Subtype /Image /Width 4000 /Height 4000 /ColorSpace /DeviceRGB /BitsPerComponent 8", &[1; 12]),
+            // Una imagen chica con una mascara suave enorme y casi sin datos.
+            stream("/Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /SMask 8 0 R", &[1, 2, 3, 4]),
+            // Un escaneo al que le falta la ultima fila sigue saliendo, con relleno.
+            stream("/Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 8", &[5; 12]),
+            stream("/Subtype /Image /Width 4000 /Height 4000 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0; 3]),
+        ],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    assert!(d.images[0].data.is_none());
+    assert!(d.images[0].note.as_deref().unwrap_or("").contains("incompletos"), "{:?}", d.images[0].note);
+    // La mascara de tamano distinto se ignora: la imagen sale sin transparencia.
+    let (_, _, _, color, _, px) = decode_png(d.images[1].data.as_deref().unwrap());
+    assert_eq!((color, px), (0, vec![1, 2, 3, 4]));
+    let (_, h, _, _, _, px) = decode_png(d.images[2].data.as_deref().unwrap());
+    assert_eq!((h, &px[12..]), (4, &[0u8; 4][..]));
+}
+
+#[test]
+fn pdf_mascara_suave_con_datos_cortos_se_ignora() {
+    // Imagen completa de 300 x 300 con una mascara del mismo tamano pero de 3 bytes: la mascara
+    // no se rellena (90.000 bytes inventados); la imagen sale sin transparencia.
+    let bytes = pdf_con(
+        "/Im1 5 0 R",
+        "q 10 0 0 10 0 0 cm /Im1 Do Q",
+        vec![
+            stream("/Subtype /Image /Width 300 /Height 300 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /SMask 6 0 R", &zlib_stored(&[7; 30_000])),
+            stream("/Subtype /Image /Width 300 /Height 300 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0; 3]),
+        ],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    // 30.000 de 90.000 bytes: la imagen misma esta incompleta y no se extrae.
+    assert!(d.images[0].data.is_none(), "{:?}", d.images[0].note);
+    // Con la imagen completa, la mascara corta se ignora.
+    let bytes = pdf_con(
+        "/Im1 5 0 R",
+        "q 10 0 0 10 0 0 cm /Im1 Do Q",
+        vec![
+            stream("/Subtype /Image /Width 300 /Height 200 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /SMask 6 0 R", &zlib_stored(&[7; 60_000])),
+            stream("/Subtype /Image /Width 300 /Height 200 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0; 3]),
+        ],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    let (_, _, _, color, _, _) = decode_png(d.images[0].data.as_deref().unwrap_or_else(|| panic!("{:?}", d.images[0].note)));
+    assert_eq!(color, 0, "sin canal alfa");
+}
+
+/// Comprueba que `p` sea un PNG que un lector estricto acepta: zlib valido, filas completas y
+/// tipos de filtro 0 a 4.
+fn png_estricto(p: &[u8]) {
+    let (w, h, depth, color, _, _) = decode_png(p);
+    let channels = match color {
+        0 | 3 => 1,
+        4 => 2,
+        2 => 3,
+        _ => 4,
+    };
+    let (mut i, mut idat) = (8, Vec::new());
+    while i + 8 <= p.len() {
+        let len = u32::from_be_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]) as usize;
+        if &p[i + 4..i + 8] == b"IDAT" {
+            idat.extend_from_slice(&p[i + 8..i + 8 + len]);
+        }
+        i += 12 + len;
+    }
+    let z = doc2json::inflate::zlib(&idat);
+    assert!(z.ok, "IDAT no es zlib valido");
+    let row = (w as usize * channels * depth as usize + 7) / 8 + 1;
+    assert_eq!(z.data.len(), row * h as usize, "filas incompletas o sobrantes");
+    assert!(z.data.chunks(row).all(|r| r[0] <= 4), "tipo de filtro invalido");
+}
+
+#[test]
+fn pdf_predictor_png_que_no_es_un_png_valido_se_recodifica() {
+    let rows_ok = [0u8, 1, 2, 3, 4, 5, 6, 0, 7, 8, 9, 10, 11, 12];
+    let mut filtro_invalido = rows_ok;
+    filtro_invalido[7] = 9;
+    let mut truncado = zlib_stored(&rows_ok);
+    truncado.truncate(10);
+    let mut adler_malo = zlib_stored(&rows_ok);
+    let n = adler_malo.len();
+    adler_malo[n - 1] ^= 0xFF;
+    let dict = "/Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /Columns 2 >>";
+    let bytes = pdf_con(
+        "/Im1 5 0 R /Im2 6 0 R /Im3 7 0 R /Im4 8 0 R /Im5 9 0 R",
+        "q 1 0 0 1 0 0 cm /Im1 Do /Im2 Do /Im3 Do /Im4 Do /Im5 Do Q",
+        vec![
+            stream(dict, &zlib_stored(&rows_ok)),
+            stream(dict, &zlib_stored(&filtro_invalido)),
+            stream(dict, &zlib_stored(&rows_ok[..7])),
+            stream(dict, &truncado),
+            stream(dict, &adler_malo),
+        ],
+    );
+    let d = read_with_images(&bytes).unwrap();
+    // El valido se sigue copiando tal cual.
+    assert!(d.images[0].data.as_deref().unwrap().windows(5).any(|w| w == [0x78, 0x01, 1, 14, 0]));
+    for img in &d.images {
+        if let Some(p) = &img.data {
+            png_estricto(p);
+        }
+    }
+    // Ninguno de los danados se copia tal cual.
+    for img in &d.images[1..] {
+        assert!(!img.data.as_deref().unwrap_or(&[]).windows(3).any(|w| w == [0x78, 0x01, 1]), "imagen {} copiada sin validar", img.id);
+    }
+}
+
+#[test]
+fn word_misma_imagen_con_otras_mayusculas_no_se_repite() {
+    let ns = r#"xmlns:w="w" xmlns:wp="wp" xmlns:a="a" xmlns:pic="pic" xmlns:r="r""#;
+    let body = format!(r#"<w:document {}><w:body>{}{}</w:body></w:document>"#, ns, dibujo("rId1", 254_000, 254_000, "a"), dibujo("rId2", 254_000, 254_000, "b"));
+    let rels = format!(
+        r#"<Relationships xmlns="r"><Relationship Id="rId1" Type="{0}/image" Target="media/image1.png"/><Relationship Id="rId2" Type="{0}/image" Target="/word/MEDIA/Image1.PNG"/></Relationships>"#,
+        REL
+    );
+    let pkg = format!(r#"<Relationships xmlns="r"><Relationship Id="rId1" Type="{}/officeDocument" Target="word/document.xml"/></Relationships>"#, REL);
+    let bytes = zip(&[
+        ("_rels/.rels", pkg.as_bytes()),
+        ("word/document.xml", body.as_bytes()),
+        ("word/_rels/document.xml.rels", rels.as_bytes()),
+        ("word/media/image1.png", b"x"),
+    ]);
+    let d = read_with_images(&bytes).unwrap();
+    assert_eq!(d.images.len(), 1);
+    assert_eq!(d.images[0].places.len(), 2);
+}
+
+#[test]
+fn word_imagen_vinculada_no_se_lee_del_paquete() {
+    // Vinculada (TargetMode="External"): aunque el destino se parezca a una parte del paquete, no
+    // se lee de ahi; tampoco una direccion de archivo o de red.
+    let ns = r#"xmlns:w="w" xmlns:wp="wp" xmlns:a="a" xmlns:pic="pic" xmlns:r="r""#;
+    let body = format!(r#"<w:document {}><w:body>{}{}</w:body></w:document>"#, ns, dibujo("rId1", 254_000, 254_000, "a"), dibujo("rId2", 254_000, 254_000, "b"));
+    let rels = format!(
+        r#"<Relationships xmlns="r"><Relationship Id="rId1" Type="{0}/image" Target="media/image1.png" TargetMode="External"/><Relationship Id="rId2" Type="{0}/image" Target="file:///C:/fotos/x.png" TargetMode="External"/></Relationships>"#,
+        REL
+    );
+    let pkg = format!(r#"<Relationships xmlns="r"><Relationship Id="rId1" Type="{}/officeDocument" Target="word/document.xml"/></Relationships>"#, REL);
+    let bytes = zip(&[
+        ("_rels/.rels", pkg.as_bytes()),
+        ("word/document.xml", body.as_bytes()),
+        ("word/_rels/document.xml.rels", rels.as_bytes()),
+        ("media/image1.png", b"interna"),
+        ("word/media/image1.png", b"interna"),
+    ]);
+    let d = read_with_images(&bytes).unwrap();
+    assert_eq!(d.images.len(), 2);
+    for img in &d.images {
+        assert!(img.data.is_none(), "{:?}", img.name);
+        assert!(img.note.as_deref().unwrap_or("").contains("vinculada"), "{:?}", img.note);
+    }
+}
+
+#[test]
+fn tope_de_bytes_extraidos_por_documento() {
+    // PDF: con un tope de 40 bytes entran las primeras imagenes chicas; las demas quedan con nota.
+    let d = doc2json::read_with_image_budget(&pdf_con_imagenes(), 40).unwrap();
+    let total: usize = d.images.iter().filter_map(|i| i.data.as_ref()).map(|b| b.len()).sum();
+    assert!(total <= 40);
+    let topadas = d.images.iter().filter(|i| i.note.as_deref().unwrap_or("").contains("tope")).count();
+    assert!(topadas > 0);
+    assert!(d.warnings.iter().any(|w| w.contains(&format!("{} imagenes no se extrajeron", topadas))), "{:?}", d.warnings);
+    // Word: la primera imagen no cabe y no se descomprime; la segunda (el logo) si.
+    let img = png::encode(&Spec { width: 40, height: 40, depth: 8, color: Color::Gray, palette: Vec::new() }, &[7; 1600]).unwrap();
+    let logo = png::encode(&Spec { width: 1, height: 1, depth: 8, color: Color::Rgb, palette: Vec::new() }, &[1, 2, 3]).unwrap();
+    let d = doc2json::read_with_image_budget(&docx_con_imagenes(&img, &logo), logo.len()).unwrap();
+    assert!(d.images[0].data.is_none());
+    assert_eq!(d.images[1].data.as_deref(), Some(&logo[..]));
+    assert_eq!(d.warnings.len(), 1);
+}
+
+#[test]
+fn topes_de_imagenes_distintas_y_de_lugares() {
+    // 10.001 imagenes distintas: la ultima no figura, con aviso.
+    let n = 10_001;
+    let names: String = (0..n).map(|i| format!("/I{} {} 0 R ", i, i + 5)).collect();
+    let content: String = (0..n).map(|i| format!("/I{} Do ", i)).collect();
+    let imgs = (0..n).map(|_| stream("/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0])).collect();
+    let d = read(&pdf_con(&names, &content, imgs)).unwrap();
+    assert_eq!(d.images.len(), 10_000);
+    assert!(d.warnings.iter().any(|w| w.contains("mas de 10000 imagenes")), "{:?}", d.warnings);
+
+    // Dos paginas que comparten un contenido con 60.000 dibujos de la misma imagen: 120.000
+    // lugares, de los que se registran 100.000.
+    let bytes = pdf(&[
+        obj("<< /Type /Catalog /Pages 2 0 R >>"),
+        obj("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>"),
+        obj("<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /XObject << /I 6 0 R >> >> >>"),
+        obj("<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /XObject << /I 6 0 R >> >> >>"),
+        stream("", "/I Do ".repeat(60_000).as_bytes()),
+        stream("/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0]),
+    ]);
+    let d = read(&bytes).unwrap();
+    assert_eq!(d.images[0].places.len(), 100_000);
+    assert!(d.warnings.iter().any(|w| w.contains("20000 lugares")), "{:?}", d.warnings);
 }

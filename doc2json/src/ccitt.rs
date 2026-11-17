@@ -3,7 +3,16 @@
 //! Es el filtro `CCITTFaxDecode` de PDF y el modo MMR de JBIG2. Devuelve filas de bits
 //! empaquetadas (la fila completa en bytes, el bit mas significativo primero) con 1 = negro;
 //! quien lo usa invierte si necesita otra convencion. Un archivo danado no es un error: se
-//! entrega lo decodificado hasta ahi y el resto de las filas queda en blanco.
+//! entrega lo decodificado hasta ahi y el resto de las filas queda en blanco. Si es un error un
+//! tamano declarado fuera de rango: la memoria se reserva segun las columnas y filas declaradas.
+//!
+//! Escrito a partir de las recomendaciones UIT-T T.4 (codigos de largo de corrida, tablas 2 y 3,
+//! y codificacion de dos dimensiones, 4.2) y T.6 (grupo 4).
+
+/// Tope de columnas: ningun escaneo real se acerca (una hoja A0 a 1.200 dpi tiene unas 40.000).
+pub const MAX_COLUMNS: usize = 1 << 20;
+/// Tope de pixeles (columnas por filas) de una decodificacion: 25 MB de filas empaquetadas.
+pub const MAX_PIXELS: u64 = 200_000_000;
 
 /// Parametros de `/DecodeParms` (con sus valores por defecto de PDF).
 #[derive(Clone, Debug)]
@@ -154,7 +163,8 @@ impl Decoder<'_> {
                 return None;
             }
             self.bits.skip(len as usize);
-            total += run as usize;
+            // Saturado: con codigos de relleno de 2.560 seguidos, en wasm32 la suma desbordaria.
+            total = total.saturating_add(run as usize);
             if run < 64 {
                 return Some(total);
             }
@@ -200,7 +210,7 @@ impl Decoder<'_> {
         let mut changes = Vec::new();
         let (mut pos, mut black) = (0usize, false);
         while pos < self.columns {
-            pos = (pos + self.run(black)?).min(self.columns);
+            pos = pos.saturating_add(self.run(black)?).min(self.columns);
             changes.push(pos);
             black = !black;
         }
@@ -273,10 +283,16 @@ fn paint(row: &mut [u8], changes: &[usize], columns: usize) {
 }
 
 /// Decodifica hasta `height` filas (o `p.rows`). Devuelve las filas (1 = negro) y cuantas
-/// se decodificaron de verdad (las demas quedan en blanco).
-pub fn decode(data: &[u8], p: &Params, height: usize) -> (Vec<u8>, usize) {
+/// se decodificaron de verdad (las demas quedan en blanco). Es un error que las columnas pasen de
+/// `MAX_COLUMNS` o que columnas por filas pase de `MAX_PIXELS`.
+pub fn decode(data: &[u8], p: &Params, height: usize) -> Result<(Vec<u8>, usize), String> {
     let columns = p.columns.max(1);
     let rows = if p.rows > 0 { p.rows } else { height };
+    // En u64: en wasm32 el producto en usize puede desbordar y dar 0 (o poco), y la primera fila
+    // quedaria fuera del arreglo.
+    if columns > MAX_COLUMNS || (columns as u64).saturating_mul(rows as u64) > MAX_PIXELS {
+        return Err(format!("Fax demasiado grande para decodificarlo ({} columnas, {} filas).", p.columns, rows));
+    }
     let stride = columns.div_ceil(8);
     let mut out = vec![0u8; stride * rows];
     let mut d = Decoder { bits: Bits { data, pos: 0 }, white: table(&WHITE_TERM, &WHITE_MAKEUP), black: table(&BLACK_TERM, &BLACK_MAKEUP), columns };
@@ -334,7 +350,7 @@ pub fn decode(data: &[u8], p: &Params, height: usize) -> (Vec<u8>, usize) {
         reference.extend_from_slice(&[columns, columns, columns]);
         decoded = y + 1;
     }
-    (out, decoded)
+    Ok((out, decoded))
 }
 
 #[cfg(test)]
@@ -382,7 +398,7 @@ mod tests {
         let mut w = W(Vec::new());
         w.s("000000000001").run(5, false).run(10, true).run(5, false);
         w.s("000000000001").run(0, false).run(20, true);
-        let (out, n) = decode(&w.bytes(), &Params { columns: 20, ..Params::default() }, 2);
+        let (out, n) = decode(&w.bytes(), &Params { columns: 20, ..Params::default() }, 2).unwrap();
         assert_eq!(n, 2);
         assert_eq!(out, [0b0000_0111, 0b1111_1110, 0b0000_0000, 0xFF, 0xFF, 0xF0]);
     }
@@ -398,7 +414,7 @@ mod tests {
         w.s("011").s("011").s("1");
         w.s("0001").s("1");
         w.s("000000000001000000000001");
-        let (out, n) = decode(&w.bytes(), &Params { k: -1, columns: 16, ..Params::default() }, 4);
+        let (out, n) = decode(&w.bytes(), &Params { k: -1, columns: 16, ..Params::default() }, 4).unwrap();
         assert_eq!(n, 4);
         assert_eq!(out, [0b0001_1110, 0, 0b0001_1110, 0, 0b0000_1111, 0, 0, 0]);
     }
@@ -408,10 +424,105 @@ mod tests {
         let mut w = W(Vec::new());
         // 2000 blancos con el codigo extendido de 1984 mas 16; luego 48 negros.
         w.s(EXTENDED_MAKEUP[3]).run(16, false).run(48, true);
-        let (out, n) = decode(&w.bytes(), &Params { columns: 2048, ..Params::default() }, 3);
+        let (out, n) = decode(&w.bytes(), &Params { columns: 2048, ..Params::default() }, 3).unwrap();
         assert_eq!(n, 1);
         assert_eq!(out.len(), 3 * 256);
         assert_eq!(&out[249..256], &[0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(out[256..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn tamanos_declarados_fuera_de_rango() {
+        let data = [0xFF, 0xFF];
+        let g4 = |columns: usize, rows: usize| Params { k: -1, columns, rows, ..Params::default() };
+        // En 64 bits el producto desbordaba; en wasm32, 2^31 columnas por 16 filas daba 0 bytes y
+        // la primera fila quedaba fuera del arreglo.
+        for (columns, rows) in [(1usize << 62, 16usize), (1 << 31, 16), (MAX_COLUMNS + 1, 1), (MAX_COLUMNS, 1000)] {
+            let e = decode(&data, &g4(columns, rows), rows).unwrap_err();
+            assert!(e.contains("demasiado grande"), "{} x {}: {}", columns, rows, e);
+        }
+        // Sin /Rows, el alto pedido por quien llama tambien cuenta.
+        assert!(decode(&data, &g4(1000, 0), usize::MAX).is_err());
+        // Dentro del tope, una hoja A3 a 600 dpi se puede decodificar.
+        let (out, n) = decode(&data, &g4(7016, 9921), 9921).unwrap();
+        assert_eq!((out.len(), n > 0), (877 * 9921, true));
+    }
+
+    /// Generador pseudoaleatorio fijo (xorshift), para que las pruebas se repitan igual.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    #[test]
+    fn datos_alterados_no_rompen_ni_demoran() {
+        // Filas al azar codificadas en grupo 3 (una dimension, con fin de linea) y en grupo 4 (solo
+        // modo horizontal); luego bytes cambiados, cortes y parametros al azar.
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut seeds = Vec::new();
+        for _ in 0..12 {
+            let columns = 1 + rng.below(300) as usize;
+            let rows = 1 + rng.below(40) as usize;
+            let (mut g3, mut g4) = (W(Vec::new()), W(Vec::new()));
+            for _ in 0..rows {
+                g3.s("000000000001");
+                let mut pos = 0;
+                let mut black = false;
+                while pos < columns {
+                    let run = (1 + rng.below(40) as usize).min(columns - pos);
+                    g3.run(run, black);
+                    pos += run;
+                    black = !black;
+                }
+                if black {
+                    g3.run(0, true);
+                }
+                let mut pos = 0;
+                while pos < columns {
+                    let white = (rng.below(30) as usize).min(columns - pos);
+                    let black = (rng.below(30) as usize).min(columns - pos - white);
+                    g4.s("001").run(white, false).run(black, true);
+                    pos += white + black;
+                    if white + black == 0 {
+                        break;
+                    }
+                }
+            }
+            g4.s("000000000001000000000001");
+            seeds.push((g3.bytes(), Params { columns, ..Params::default() }, rows));
+            seeds.push((g4.bytes(), Params { k: -1, columns, ..Params::default() }, rows));
+        }
+        for case in 0..4000 {
+            let (base, p, rows) = &seeds[rng.below(seeds.len() as u64) as usize];
+            let mut data = if case % 10 == 0 { (0..rng.below(64)).map(|_| rng.next() as u8).collect() } else { base.clone() };
+            for _ in 0..rng.below(5) {
+                if !data.is_empty() {
+                    let i = rng.below(data.len() as u64) as usize;
+                    data[i] = if rng.below(2) == 0 { data[i] ^ (1 << rng.below(8)) } else { rng.next() as u8 };
+                }
+            }
+            if rng.below(4) == 0 {
+                data.truncate(rng.below(data.len() as u64 + 1) as usize);
+            }
+            let mut p = p.clone();
+            if rng.below(4) == 0 {
+                p.k = [-1, 0, 1, 4][rng.below(4) as usize];
+                p.byte_align = rng.below(2) == 0;
+                p.end_of_block = rng.below(2) == 0;
+                p.columns = rng.below(5000) as usize;
+                p.rows = rng.below(3000) as usize;
+            }
+            let start = std::time::Instant::now();
+            let _ = decode(&data, &p, *rows + rng.below(3) as usize);
+            assert!(start.elapsed().as_secs() < 2, "caso {}: demasiado lento", case);
+        }
     }
 }

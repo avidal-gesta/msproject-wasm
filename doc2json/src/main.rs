@@ -60,7 +60,7 @@ fn main() -> ExitCode {
         Ok(b) => b,
         Err(e) => return fail(&format!("No se pudo leer {}: {}", input.display(), e)),
     };
-    let doc = match doc2json::read_with_options(&bytes, limits, images.is_some()) {
+    let doc = match doc2json::read_with_options(&bytes, limits, images.as_ref().map(|_| doc2json::image::MAX_EXTRACTED)) {
         Ok(d) => d,
         Err(e) => return fail(&e),
     };

@@ -13,7 +13,7 @@
 //! No se lee el texto de graficos ni de SmartArt.
 
 use crate::doc::*;
-use crate::docx::{extract_images, letters, part_rels, properties, relationships, resolve, roman};
+use crate::docx::{extract_images, image_key, letters, part_rels, properties, relationships, resolve, roman};
 use crate::image::{format_from_name, ImageSet};
 use crate::symbols::{classify, translate, translate_str, SymbolFont};
 use crate::xml::{Ev, Tag, Xml};
@@ -105,7 +105,7 @@ struct Para {
 }
 
 /// Lee un `a:p` (ya abierto) hasta su cierre.
-fn paragraph(x: &mut Xml, rels: &HashMap<String, String>) -> Para {
+fn paragraph(x: &mut Xml, rels: &HashMap<String, (String, bool)>) -> Para {
     let mut p = Para { text: String::new(), runs: Vec::new(), level: 0, bullet: None, auto: None };
     let mut bu_font = SymbolFont::None;
     let mut cur = Run::default();
@@ -139,7 +139,7 @@ fn paragraph(x: &mut Xml, rels: &HashMap<String, String>) -> Para {
                 }
                 "a:latin" => latin = classify(&t.attr("typeface").unwrap_or_default()),
                 "a:sym" => sym = classify(&t.attr("typeface").unwrap_or_default()),
-                "a:hlinkClick" => cur.link = t.attr("r:id").and_then(|id| rels.get(&id).cloned()),
+                "a:hlinkClick" => cur.link = t.attr("r:id").and_then(|id| rels.get(&id).map(|(target, _)| target.clone())),
                 "a:t" if !t.empty => in_t = true,
                 "a:br" => {
                     p.text.push('\n');
@@ -167,7 +167,7 @@ fn paragraph(x: &mut Xml, rels: &HashMap<String, String>) -> Para {
 }
 
 /// Texto de un `p:txBody` o `a:txBody` (ya abierto) como bloques segun el rol de la forma.
-fn text_body(x: &mut Xml, end: &str, role: Role, rels: &HashMap<String, String>, slide: u32) -> Vec<Block> {
+fn text_body(x: &mut Xml, end: &str, role: Role, rels: &HashMap<String, (String, bool)>, slide: u32) -> Vec<Block> {
     let mut out = Vec::new();
     // Contadores de numeracion automatica por nivel (se reinician al cambiar de tipo).
     let mut counters: [Option<(String, i64)>; 9] = Default::default();
@@ -225,7 +225,7 @@ fn text_body(x: &mut Xml, end: &str, role: Role, rels: &HashMap<String, String>,
 }
 
 /// Tabla (`a:tbl`, ya abierta).
-fn table(x: &mut Xml, rels: &HashMap<String, String>, slide: u32) -> Block {
+fn table(x: &mut Xml, rels: &HashMap<String, (String, bool)>, slide: u32) -> Block {
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     while let Some(ev) = x.next() {
         match ev {
@@ -279,7 +279,7 @@ impl Flag for Tag<'_> {
 }
 
 /// Lee las formas de un `p:spTree` o `p:grpSp` (ya abierto) hasta `end`.
-fn shapes(x: &mut Xml, end: &str, rels: &HashMap<String, String>, slide: u32, depth: usize, set: &mut ImageSet) -> Vec<Item> {
+fn shapes(x: &mut Xml, end: &str, rels: &HashMap<String, (String, bool)>, slide: u32, depth: usize, set: &mut ImageSet) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::new();
     // Datos de la forma en curso.
     let mut ph: Option<(String, bool)> = None;
@@ -289,7 +289,7 @@ fn shapes(x: &mut Xml, end: &str, rels: &HashMap<String, String>, slide: u32, de
     let mut pending: Vec<Block> = Vec::new();
     // Imagenes de la forma (indice en `pending` y ruta de la parte): se registran al cerrar la
     // forma, cuando ya se conoce su rectangulo (`p:spPr` viene despues de `p:blipFill`).
-    let mut pics: Vec<(usize, String)> = Vec::new();
+    let mut pics: Vec<(usize, String, bool)> = Vec::new();
     let mut in_shape = 0usize;
     while let Some(ev) = x.next() {
         match ev {
@@ -334,9 +334,9 @@ fn shapes(x: &mut Xml, end: &str, rels: &HashMap<String, String>, slide: u32, de
                 "a:tbl" if !t.empty => pending.push(table(x, rels, slide)),
                 "a:blip" => {
                     let target = t.attr("r:embed").or_else(|| t.attr("r:link")).and_then(|id| rels.get(&id).cloned());
-                    let name = target.as_ref().map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
-                    if let Some(p) = target {
-                        pics.push((pending.len(), p));
+                    let name = target.as_ref().map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string());
+                    if let Some((p, external)) = target {
+                        pics.push((pending.len(), p, external));
                     }
                     pending.push(Block { kind: Kind::Image, name, text: alt.trim().to_string(), page: Some(slide), ..Block::default() });
                 }
@@ -347,13 +347,12 @@ fn shapes(x: &mut Xml, end: &str, rels: &HashMap<String, String>, slide: u32, de
                 // Rectangulo en puntos (1 punto = 12.700 EMU). Dentro de un grupo, en las
                 // coordenadas del grupo, que casi siempre son las de la diapositiva.
                 let pt = |v: i64| (v as f64 / 12_700.0 * 100.0).round() / 100.0;
-                for (k, path) in pics.drain(..) {
+                for (k, path, external) in pics.drain(..) {
                     let (w, h) = size.map_or((0.0, 0.0), |(w, h)| (pt(w), pt(h)));
                     let at = |v: i64| (v != i64::MAX).then(|| pt(v));
                     let place = Place { page: Some(slide), x: at(ox), y: at(oy), w, h };
                     let name = pending[k].name.clone();
-                    let id = set.add(&path, Some(place), &pending[k].text, || Image { format: format_from_name(&path), name, ..Image::default() });
-                    pending[k].image = Some(id);
+                    pending[k].image = set.add(&image_key(&path, external), Some(place), &pending[k].text, || Image { format: format_from_name(&path), name, ..Image::default() });
                 }
                 if !pending.is_empty() {
                     let title = role_of(ph.clone()) == Role::Title;
@@ -421,11 +420,11 @@ fn notes(zip: &ZipArchive, slide_path: &str, number: u32) -> Option<Block> {
 }
 
 pub fn read(data: &[u8]) -> Result<Document, String> {
-    read_opts(data, false)
+    read_opts(data, None)
 }
 
 /// Lee la presentacion; con `images` agrega los bytes de cada imagen de `Document::images`.
-pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
+pub fn read_opts(data: &[u8], images: Option<usize>) -> Result<Document, String> {
     let zip = ZipArchive::open(data).map_err(|_| "El archivo .pptx esta danado o incompleto: no se pudo abrir como ZIP.".to_string())?;
     let main = relationships(&zip, "_rels/.rels")
         .into_iter()
@@ -444,7 +443,7 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
     while let Some(ev) = x.next() {
         if let Ev::Start(t) = ev {
             if t.name == "p:sldId" {
-                if let Some(p) = t.attr("r:id").and_then(|id| rels.get(&id).cloned()) {
+                if let Some(p) = t.attr("r:id").and_then(|id| rels.get(&id).map(|(target, _)| target.clone())) {
                     order.push(p);
                 }
             }
@@ -492,9 +491,10 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
     if hidden > 0 {
         doc.warnings.push(format!("Se omitieron {} diapositivas ocultas.", hidden));
     }
+    doc.warnings.extend(set.warnings());
     doc.images = set.list;
-    if images {
-        extract_images(&zip, &mut doc.images, &set.keys);
+    if let Some(limit) = images {
+        doc.warnings.extend(extract_images(&zip, &mut doc.images, &set.keys, limit));
     }
     Ok(doc)
 }

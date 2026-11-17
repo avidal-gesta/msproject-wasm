@@ -67,11 +67,14 @@ struct Marked {
     opens: bool,
 }
 
-/// Una imagen dibujada: su objeto, su diccionario y la transformacion con que se dibujo.
+/// Una imagen dibujada: su objeto y la transformacion con que se dibujo.
 pub struct ImageUse {
-    /// Numero y generacion del objeto (las imagenes se reconocen por el, aunque se repitan).
-    pub key: Option<(u32, u16)>,
-    pub dict: Dict,
+    /// Numero del objeto: las imagenes se reconocen por el aunque se repitan. Sin la generacion,
+    /// porque `Pdf::resolve` tampoco la usa (`7 0 R` y `7 1 R` son el mismo objeto).
+    pub key: Option<u32>,
+    /// El objeto compartido (el mismo `Rc` del cache del PDF): dibujar mil veces una imagen no
+    /// copia mil veces su diccionario.
+    pub obj: Rc<Obj>,
     pub ctm: Matrix,
 }
 
@@ -463,12 +466,10 @@ impl<'p, 'a> Interp<'p, 'a> {
     }
 
     fn xobject(&mut self, resources: &Dict, name: &str, st: &State) {
-        let xobjects = match self.pdf.dict(resources, "XObject") {
-            Some(x) => x,
-            None => return,
-        };
-        let (obj, key) = match xobjects.get(name) {
-            Some(o) => (self.pdf.resolve(o), if let Obj::Ref(n, g) = o { Some((*n, *g)) } else { None }),
+        // Sin copiar el diccionario de recursos: se dibujan muchas veces.
+        let xobjects = self.pdf.get(resources, "XObject");
+        let (obj, key) = match xobjects.as_dict().and_then(|x| x.get(name)) {
+            Some(o) => (self.pdf.resolve(o), if let Obj::Ref(n, _) = o { Some(*n) } else { None }),
             None => return,
         };
         let dict = match obj.as_dict() {
@@ -479,7 +480,7 @@ impl<'p, 'a> Interp<'p, 'a> {
             Some("Image") => {
                 self.out.images += 1;
                 if self.out.uses.len() < 100_000 {
-                    self.out.uses.push(ImageUse { key, dict: dict.clone(), ctm: st.ctm });
+                    self.out.uses.push(ImageUse { key, obj: obj.clone(), ctm: st.ctm });
                 }
             }
             Some("Form") if self.depth < 12 => {

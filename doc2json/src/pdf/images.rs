@@ -13,6 +13,7 @@
 use super::document::Pdf;
 use super::filters::{self, Parms};
 use super::object::{Dict, Obj};
+use crate::inflate;
 use crate::png::{self, Color, Spec};
 use crate::{ccitt, jbig2};
 
@@ -211,7 +212,7 @@ pub fn extract(pdf: &Pdf, obj: &Obj) -> Result<(&'static str, Vec<u8>, Option<St
         }
         match name.as_str() {
             "CCITTFaxDecode" | "CCF" => {
-                let (rows, decoded) = ccitt_samples(pdf, &data, w, h, raw.as_ref());
+                let (rows, decoded) = ccitt_samples(pdf, &data, w, h, raw.as_ref())?;
                 if decoded == 0 {
                     let tiff = ccitt_tiff(pdf, &data, w, h, raw.as_ref(), inverted(pdf, d));
                     return Ok(("tiff", tiff, Some("No se pudo decodificar el fax: se entrega tal cual, como TIFF.".into())));
@@ -259,19 +260,26 @@ fn pack(px: &[u8], w: usize, h: usize, invert: bool) -> Vec<u8> {
 }
 
 /// Fax decodificado como lo entrega el filtro de PDF (sin `BlackIs1`, 0 = negro), con filas del
-/// ancho de la imagen. Devuelve tambien cuantas filas se decodificaron.
-fn ccitt_samples(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>) -> (Vec<u8>, usize) {
+/// ancho de la imagen. Devuelve tambien cuantas filas se decodificaron. Columnas o filas fuera de
+/// rango son un error.
+fn ccitt_samples(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>) -> Result<(Vec<u8>, usize), String> {
     let get = |k: &str| parms.and_then(|p| pdf.get(p, k).as_i64());
     let on = |k: &str| parms.is_some_and(|p| flag(pdf, p, k));
-    let columns = get("Columns").filter(|&c| c > 0).unwrap_or(w as i64) as usize;
+    // Sin `as usize`: en wasm32 truncaria un valor enorme del archivo a uno chico cualquiera.
+    let size = |k: &str, default: u32| match get(k) {
+        Some(v) if v > 0 => usize::try_from(v).map_err(|_| format!("Fax con /{} fuera de rango ({}).", k, v)),
+        _ => Ok(default as usize),
+    };
+    let columns = size("Columns", w)?;
     let p = ccitt::Params {
         k: get("K").unwrap_or(0),
         columns,
-        rows: get("Rows").filter(|&r| r > 0).unwrap_or(h as i64) as usize,
+        // Mas filas que las de la imagen no se usan: no se decodifican.
+        rows: size("Rows", h)?.min(h as usize),
         byte_align: on("EncodedByteAlign"),
-        end_of_block: parms.is_none_or(|p| !matches!(&*pdf.get(p, "EndOfBlock"), Obj::Bool(false))),
+        end_of_block: !parms.is_some_and(|p| matches!(&*pdf.get(p, "EndOfBlock"), Obj::Bool(false))),
     };
-    let (rows, decoded) = ccitt::decode(data, &p, h as usize);
+    let (rows, decoded) = ccitt::decode(data, &p, h as usize)?;
     let black_is_1 = on("BlackIs1");
     let (w, h) = (w as usize, h as usize);
     let src_stride = columns.div_ceil(8);
@@ -291,7 +299,7 @@ fn ccitt_samples(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>) -
     if !black_is_1 {
         out.iter_mut().for_each(|b| *b = !*b);
     }
-    (out, decoded)
+    Ok((out, decoded))
 }
 
 fn bits(pdf: &Pdf, d: &Dict) -> u8 {
@@ -304,13 +312,16 @@ fn bits(pdf: &Pdf, d: &Dict) -> u8 {
     }
 }
 
-/// Los datos Flate con predictor PNG ya son el contenido de IDAT de un PNG.
+/// Los datos Flate con predictor PNG ya son el contenido de IDAT de un PNG. Se copian solo si un
+/// lector de PNG estricto los aceptaria: zlib sin diccionario, filas completas, tipos de filtro
+/// 0 a 4 y suma Adler-32 correcta. Si no, `None` y la imagen se decodifica y se vuelve a comprimir.
 fn passthrough(pdf: &Pdf, d: &Dict, data: &[u8], w: u32, h: u32, p: &Parms) -> Option<Vec<u8>> {
     if d.get("SMask").is_some() || p.predictor < 10 || inverted(pdf, d) {
         return None;
     }
-    // Encabezado zlib valido: algunos PDF traen DEFLATE sin el, que un PNG no admite.
-    if data.len() < 2 || data[0] & 0x0F != 8 || !((data[0] as u32) << 8 | data[1] as u32).is_multiple_of(31) {
+    // Encabezado zlib valido y sin diccionario previo: algunos PDF traen DEFLATE sin el, y un
+    // PNG no admite ninguna de las dos cosas.
+    if data.len() < 6 || data[0] & 0x0F != 8 || ((data[0] as u32) << 8 | data[1] as u32) % 31 != 0 || data[1] & 0x20 != 0 {
         return None;
     }
     let bpc = bits(pdf, d);
@@ -323,17 +334,40 @@ fn passthrough(pdf: &Pdf, d: &Dict, data: &[u8], w: u32, h: u32, p: &Parms) -> O
     if p.colors != color.channels() as i64 || p.bits != bpc as i64 || p.columns != w as i64 {
         return None;
     }
-    let palette = trim_palette(palette, bpc);
-    Some(png::from_idat(&Spec { width: w, height: h, depth: bpc, color, palette }, data))
+    let spec = Spec { width: w, height: h, depth: bpc, color, palette: fit_palette(palette, bpc) };
+    let row = png::row_bytes(&spec)?.checked_add(1)?;
+    let rows = inflate::inflate(&data[2..]);
+    let adler = u32::from_be_bytes([data[data.len() - 4], data[data.len() - 3], data[data.len() - 2], data[data.len() - 1]]);
+    let valid = rows.ok
+        && Some(rows.data.len()) == row.checked_mul(h as usize)
+        && rows.data.chunks(row).all(|r| r[0] <= 4)
+        && png::adler32(&rows.data) == adler;
+    valid.then(|| png::from_idat(&spec, data))
 }
 
-/// Un PNG admite a lo sumo 2^bits entradas de paleta.
-fn trim_palette(mut pal: Vec<u8>, bpc: u8) -> Vec<u8> {
-    pal.truncate((1usize << bpc.min(8)) * 3);
-    if pal.is_empty() {
-        pal = vec![0, 0, 0];
-    }
+/// Paleta para el PNG: exactamente una entrada por cada indice posible con `bpc` bits. Un PNG no
+/// admite mas, y un indice sin entrada lo deja invalido: las que el PDF no trae quedan en negro.
+fn fit_palette(mut pal: Vec<u8>, bpc: u8) -> Vec<u8> {
+    pal.resize((1usize << bpc.min(8)) * 3, 0);
     pal
+}
+
+/// Bytes de una imagen de `w` x `h` con `comps` componentes de `bpc` bits, filas completas al
+/// byte. `None` si no cabe en la memoria direccionable (en wasm32, 4 GB).
+fn image_bytes(w: u32, h: u32, comps: usize, bpc: u8) -> Option<usize> {
+    let row = (w as u64).checked_mul(comps as u64)?.checked_mul(bpc as u64)?.checked_add(7)? / 8;
+    usize::try_from(row.checked_mul(h as u64)?).ok()
+}
+
+/// Los datos decodificados alcanzan para la imagen declarada. Faltando algo (un escaneo
+/// cortado), se completa con ceros; faltando mas de la mitad no se extrae: el tamano declarado
+/// no debe decidir cuanta memoria se pide si los datos no lo respaldan.
+fn enough(len: usize, need: Option<usize>) -> Result<usize, String> {
+    match need {
+        Some(n) if len >= n - n / 2 => Ok(n),
+        Some(n) => Err(format!("Los datos de la imagen estan incompletos ({} de {} bytes).", len, n)),
+        None => Err("Imagen demasiado grande para extraerla.".into()),
+    }
 }
 
 /// Muestra `i` de una fila (sin escalar).
@@ -362,7 +396,7 @@ fn scale(v: u16, bpc: u8) -> u8 {
 fn to_8bit(space: &Space, data: &[u8], w: u32, h: u32, bpc: u8, invert: bool) -> Result<(Vec<u8>, Color), String> {
     let (w, h) = (w as usize, h as usize);
     let comps = space.components();
-    let row = (w * comps * bpc as usize).div_ceil(8);
+    let row = (w * comps * bpc as usize + 7) / 8;
     let gray = matches!(space, Space::Gray | Space::Tint);
     let mut out = Vec::with_capacity(w * h * if gray { 1 } else { 3 });
     let empty: Vec<u8> = Vec::new();
@@ -405,6 +439,8 @@ fn soft_mask(pdf: &Pdf, d: &Dict, w: u32, h: u32) -> Option<(Vec<u8>, Option<Vec
         return None;
     }
     let data = pdf.stream_data(&obj)?;
+    // Una mascara sin datos que la respalden se ignora: la imagen sale sin transparencia.
+    enough(data.len(), image_bytes(w, h, 1, bits(pdf, md))).ok()?;
     let matte = pdf.array(md, "Matte").map(|m| m.iter().map(|v| v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).collect());
     to_8bit(&Space::Gray, &data, w, h, bits(pdf, md), inverted(pdf, md)).ok().map(|(a, _)| (a, matte))
 }
@@ -416,6 +452,7 @@ fn pixels_to_png(pdf: &Pdf, d: &Dict, mut data: Vec<u8>, w: u32, h: u32) -> Resu
     if let Space::Other(name) = &space {
         return Err(format!("Espacio de color {} no soportado.", name));
     }
+    enough(data.len(), image_bytes(w, h, space.components(), bpc))?;
     if let Some((alpha, matte)) = soft_mask(pdf, d, w, h) {
         let (pixels, color) = to_8bit(&space, &data, w, h, bpc, invert)?;
         let ch = color.channels();
@@ -433,32 +470,37 @@ fn pixels_to_png(pdf: &Pdf, d: &Dict, mut data: Vec<u8>, w: u32, h: u32) -> Resu
             out.push(a);
         }
         let color = if color == Color::Gray { Color::GrayAlpha } else { Color::Rgba };
-        return Ok(png::encode(&Spec { width: w, height: h, depth: 8, color, palette: Vec::new() }, &out));
+        return encode(&Spec { width: w, height: h, depth: 8, color, palette: Vec::new() }, &out);
     }
     // Sin transparencia se conserva la profundidad original cuando PNG la admite.
     let native = match &space {
         Space::Gray | Space::Tint => Some((Color::Gray, Vec::new())),
         Space::Rgb if bpc >= 8 => Some((Color::Rgb, Vec::new())),
-        Space::Indexed(pal) if bpc <= 8 => Some((Color::Palette, trim_palette(pal.clone(), bpc))),
+        Space::Indexed(pal) if bpc <= 8 => Some((Color::Palette, fit_palette(pal.clone(), bpc))),
         _ => None,
     };
     match native {
         Some((color, palette)) => {
             let spec = Spec { width: w, height: h, depth: bpc, color, palette };
-            let need = png::row_bytes(&spec) * h as usize;
+            // Ya se comprobo que los datos cubren al menos la mitad: el relleno queda acotado.
+            let need = png::row_bytes(&spec).and_then(|r| r.checked_mul(h as usize)).ok_or("Imagen demasiado grande para extraerla.")?;
             data.resize(need, 0);
             // Invertir todos los bits invierte cada muestra: v -> maximo - v.
             let flip = (space == Space::Tint) != invert && color == Color::Gray;
             if flip {
                 data.iter_mut().for_each(|b| *b = !*b);
             }
-            Ok(png::encode(&spec, &data))
+            encode(&spec, &data)
         }
         None => {
             let (pixels, color) = to_8bit(&space, &data, w, h, bpc, invert)?;
-            Ok(png::encode(&Spec { width: w, height: h, depth: 8, color, palette: Vec::new() }, &pixels))
+            encode(&Spec { width: w, height: h, depth: 8, color, palette: Vec::new() }, &pixels)
         }
     }
+}
+
+fn encode(spec: &Spec, pixels: &[u8]) -> Result<Vec<u8>, String> {
+    png::encode(spec, pixels).ok_or_else(|| "Los datos de la imagen estan incompletos.".to_string())
 }
 
 impl PartialEq for Space {
@@ -470,7 +512,7 @@ impl PartialEq for Space {
 /// TIFF de una tira con los datos de fax tal cual (Grupo 3 o 4 segun `K`).
 fn ccitt_tiff(pdf: &Pdf, data: &[u8], w: u32, h: u32, parms: Option<&Dict>, invert: bool) -> Vec<u8> {
     let get = |k: &str| parms.and_then(|p| pdf.get(p, k).as_i64());
-    let on = |k: &str| parms.is_some_and(|p| flag(pdf, p, k));
+    let on = |k: &str| parms.map_or(false, |p| flag(pdf, p, k));
     let k = get("K").unwrap_or(0);
     let compression: u32 = if k < 0 { 4 } else { 3 };
     // En PDF, sin BlackIs1 los bits 0 son negros: en TIFF eso es "BlackIsZero" (1).

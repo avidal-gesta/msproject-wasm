@@ -17,7 +17,7 @@
 //! Los nombres de las etiquetas se comparan sin prefijo: algunos programas escriben `<x:row>`.
 
 use crate::doc::*;
-use crate::docx::{extract_images, part_rels, properties, relationships, resolve};
+use crate::docx::{extract_images, image_key, part_rels, properties, relationships, resolve};
 use crate::image::{format_from_name, ImageSet};
 use crate::xml::{Ev, Xml};
 use crate::zipread::ZipArchive;
@@ -602,7 +602,7 @@ fn sheet_images(zip: &ZipArchive, sheet_path: &str, number: u32, set: &mut Image
         let Some(src) = zip.read_text(&drawing) else { continue };
         let rels = part_rels(zip, &drawing);
         let mut x = Xml::new(&src);
-        let (mut alt, mut pic): (String, Option<String>) = (String::new(), None);
+        let (mut alt, mut pic): (String, Option<(String, bool)>) = (String::new(), None);
         while let Some(ev) = x.next() {
             match ev {
                 Ev::Start(t) => match local(t.name) {
@@ -615,12 +615,12 @@ fn sheet_images(zip: &ZipArchive, sheet_path: &str, number: u32, set: &mut Image
                     _ => {}
                 },
                 Ev::End(n) if local(n) == "pic" => {
-                    if let Some(path) = pic.take() {
+                    if let Some((path, external)) = pic.take() {
                         let name = path.rsplit('/').next().map(str::to_string);
                         let text = alt.trim().to_string();
                         let place = Place { page: Some(number), ..Place::default() };
-                        let id = set.add(&path, Some(place), &text, || Image { format: format_from_name(&path), name: name.clone(), ..Image::default() });
-                        out.push(Block { kind: Kind::Image, name, text, page: Some(number), image: Some(id), ..Block::default() });
+                        let id = set.add(&image_key(&path, external), Some(place), &text, || Image { format: format_from_name(&path), name: name.clone(), ..Image::default() });
+                        out.push(Block { kind: Kind::Image, name, text, page: Some(number), image: id, ..Block::default() });
                     }
                 }
                 _ => {}
@@ -631,11 +631,11 @@ fn sheet_images(zip: &ZipArchive, sheet_path: &str, number: u32, set: &mut Image
 }
 
 pub fn read(data: &[u8]) -> Result<Document, String> {
-    read_opts(data, false)
+    read_opts(data, None)
 }
 
 /// Lee el libro; con `images` agrega los bytes de cada imagen de `Document::images`.
-pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
+pub fn read_opts(data: &[u8], images: Option<usize>) -> Result<Document, String> {
     let zip = ZipArchive::open(data).map_err(|_| "El archivo .xlsx esta danado o incompleto: no se pudo abrir como ZIP.".to_string())?;
     let main = relationships(&zip, "_rels/.rels")
         .into_iter()
@@ -665,7 +665,7 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
                 "workbookPr" => date1904 = matches!(t.attr("date1904").as_deref(), Some("1") | Some("true")),
                 "sheet" => {
                     let hidden = matches!(t.attr("state").as_deref(), Some("hidden") | Some("veryHidden"));
-                    let path = t.attr("r:id").and_then(|id| rels.get(&id).cloned());
+                    let path = t.attr("r:id").and_then(|id| rels.get(&id).map(|(target, _)| target.clone()));
                     sheets.push((t.attr("name").unwrap_or_default(), path, hidden));
                 }
                 _ => {}
@@ -729,9 +729,10 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
     if hidden > 0 {
         doc.warnings.push(format!("Se omitieron {} hojas ocultas.", hidden));
     }
+    doc.warnings.extend(set.warnings());
     doc.images = set.list;
-    if images {
-        extract_images(&zip, &mut doc.images, &set.keys);
+    if let Some(limit) = images {
+        doc.warnings.extend(extract_images(&zip, &mut doc.images, &set.keys, limit));
     }
     if repeated > 0 {
         doc.warnings.push(format!("Se omitieron {} referencias repetidas a hojas ya leidas.", repeated));

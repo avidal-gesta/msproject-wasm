@@ -98,6 +98,7 @@ function modoImagenes(opciones) {
  * texto plano. Con `images: true` cada imagen de `images` trae sus bytes en `data` (PNG, JPEG,
  * TIFF...; ver `format` y `mime`); con `minSide` se omiten los bytes de las imagenes con un lado
  * menor a eso.
+ * Entre todas se extraen a lo sumo 128 MB por documento: las demas quedan con `note`.
  */
 export async function docToJson(archivo, opciones) {
   if (!opciones || !opciones.images) return JSON.parse(await docToJsonText(archivo, opciones));

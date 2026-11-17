@@ -67,7 +67,7 @@ pub unsafe extern "C" fn doc_convert(ptr: *const u8, len: usize, mode: u32, mb: 
             };
             crate::markdown::chunks_json(&d, &crate::markdown::chunks(&d, size)).into_bytes()
         }),
-        4 | 5 => crate::read_with_options(input, limits, true).map(|doc| {
+        4 | 5 => crate::read_with_options(input, limits, Some(crate::image::MAX_EXTRACTED)).map(|doc| {
             let (json, blob) = crate::doc::to_json_with_images(&doc, kind == 5, mode >> 8);
             let mut out = Vec::with_capacity(4 + json.len() + blob.len());
             out.extend_from_slice(&(json.len() as u32).to_le_bytes());
