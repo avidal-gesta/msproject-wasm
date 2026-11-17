@@ -1,3 +1,4 @@
 # Las pruebas comparan estos archivos byte a byte: git no debe tocar sus finales de linea.
 ejemplo/** -text
 *.wasm binary
+doc2json/tests/datos/*.pdf binary

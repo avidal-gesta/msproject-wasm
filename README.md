@@ -157,6 +157,7 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 - Páginas a dos columnas de texto corrido: se lee primero la columna izquierda.
 - Incluye el texto de **firmas digitales, sellos y campos de formulario**, que no está en el contenido de la página sino en anotaciones.
 - Abre PDF "protegidos" contra edición o copia (cifrado RC4, AES-128 y AES-256 sin contraseña de apertura).
+  Con AES-256 no se comprueba `/Perms` (la copia cifrada de los permisos) ni se prueba la contraseña de propietario: no hacen falta para leer, porque la clave del archivo sale de la contraseña de usuario vacía.
 - Si el índice interno del archivo está dañado, lo reconstruye recorriendo el archivo.
 
 ### PowerPoint (.pptx)
@@ -483,7 +484,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 **doc2json, PDF** contra PyMuPDF
 
 - 227 PDF elegidos por variedad de programa de origen (Word, Excel, Crystal Reports, LibreOffice, iText, wkhtmltopdf, Chrome, escáneres…), 794 páginas: coincide el 99,5 % de las palabras y falta el 0,3 % de los caracteres. Lo que falta está en fuentes sin tabla de caracteres, donde la referencia también devuelve texto ilegible.
-- Descifrado probado con RC4 de 40 y 128 bits, AES-128 y AES-256 (revisiones 5 y 6), con y sin flujos de objetos: mismo texto que el original. 150 PDF reales guardados por MuPDF sin cifrar, con AES-128 y con AES-256 dan exactamente el mismo JSON.
+- Descifrado probado con RC4 de 40 y 128 bits, AES-128 y AES-256 (revisiones 5 y 6), con y sin flujos de objetos: mismo texto que el original. 150 PDF reales guardados por MuPDF sin cifrar, con AES-128 y con AES-256 dan exactamente el mismo JSON. La revisión 5 se prueba además con un PDF escrito por pypdf (`doc2json/tests/datos/`), y la 6 con datos de MuPDF.
 - Páginas apaisadas y rotadas (90°, 180°, 270°) y texto a dos columnas: mismo orden de lectura que la referencia.
 
 **doc2json, PowerPoint y Excel** contra python-pptx y openpyxl

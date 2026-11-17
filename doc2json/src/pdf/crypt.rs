@@ -398,6 +398,15 @@ pub fn aes_cbc_decrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     Aes::new(key).map(|a| a.decrypt_padded(data)).unwrap_or_default()
 }
 
+/// Descifra AES-128-CBC: los primeros 16 bytes son el vector inicial; quita el relleno final.
+/// Se mantiene por compatibilidad: es `aes_cbc_decrypt` limitado a claves de 16 bytes.
+pub fn aes128_cbc_decrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+    if key.len() != 16 {
+        return Vec::new();
+    }
+    aes_cbc_decrypt(key, data)
+}
+
 /// Hash de una contrasena para AES-256: SHA-256 en la revision 5 y el algoritmo 2.B de ISO
 /// 32000-2 en la 6. `udata` va vacio para la contrasena de usuario.
 fn hash_aes256(password: &[u8], salt: &[u8], udata: &[u8], r: i64) -> [u8; 32] {
@@ -464,8 +473,18 @@ pub struct Params<'a> {
 }
 
 const PIDE_CONTRASENA: &str = "El PDF pide una contrasena para abrirlo. Quitele la contrasena y vuelva a intentar.";
+// Mensajes fijos: no repiten nada que venga del archivo (una web podria mostrarlos como HTML).
+const METODO_DESCONOCIDO: &str = "El PDF usa un metodo de cifrado desconocido y no se puede leer.";
+const INCOHERENTE: &str = "El PDF tiene una informacion de cifrado incoherente y no se puede leer.";
+const ILEGIBLE: &str = "El PDF esta cifrado pero su informacion de cifrado no se pudo leer.";
 
 impl Crypt {
+    /// Prepara el descifrado con la contrasena de usuario vacia.
+    ///
+    /// Con AES-256 no se comprueba `/Perms` (la copia cifrada de los permisos, que solo sirve
+    /// para detectar que alguien cambio `/P`) ni se prueba la contrasena de propietario: la clave
+    /// del archivo sale de `/UE` con la contrasena de usuario, y si esta no es vacia el PDF se
+    /// rechaza igual que con RC4 y AES-128.
     pub fn new(p: &Params) -> Result<Crypt, String> {
         if p.filter != "Standard" {
             return Err("El PDF usa un sistema de proteccion no estandar (certificados o DRM) y no se puede leer.".into());
@@ -475,21 +494,29 @@ impl Crypt {
             Some("AESV2") => Ok(Method::Aes),
             Some("AESV3") => Ok(Method::Aes256),
             Some("None") | Some("Identity") | None => Ok(Method::None),
-            Some(m) => Err(format!("El PDF usa un metodo de cifrado desconocido ({m}).")),
+            Some(_) => Err(METODO_DESCONOCIDO.to_string()),
         };
         let (strings, streams, bits) = match p.v {
             1 => (Method::Rc4, Method::Rc4, 40),
             2 | 3 => (Method::Rc4, Method::Rc4, p.length.clamp(40, 128)),
             4 => (method(p.strings)?, method(p.streams)?, 128),
             5 => (method(p.strings)?, method(p.streams)?, 256),
-            v => return Err(format!("El PDF usa una version de cifrado desconocida ({v}).")),
+            _ => return Err("El PDF usa una version de cifrado desconocida y no se puede leer.".into()),
         };
+        // AES-256 va solo con la version 5, y la version 5 solo con AES-256 (o sin cifrar): una
+        // mezcla daria basura o un documento vacio.
+        if [strings, streams].iter().any(|&m| (m == Method::Aes256) != (p.v == 5) && m != Method::None) {
+            return Err(INCOHERENTE.into());
+        }
         if p.v == 5 {
+            if p.r != 5 && p.r != 6 {
+                return Err(INCOHERENTE.into());
+            }
             // Revisiones 5 y 6 (algoritmo 2.A): la entrada /U trae el hash de la contrasena de
             // usuario (32 bytes), su sal de validacion (8) y la sal de la clave (8). Con la
             // contrasena vacia, el hash con la segunda sal descifra la clave del archivo de /UE.
             if p.u.len() < 48 || p.ue.len() < 32 {
-                return Err("El PDF esta cifrado pero su informacion de cifrado no se pudo leer.".into());
+                return Err(ILEGIBLE.into());
             }
             if hash_aes256(b"", &p.u[32..40], b"", p.r) != p.u[..32] {
                 return Err(PIDE_CONTRASENA.into());
@@ -704,6 +731,100 @@ mod tests {
         pdf
     }
 
+    fn mupdf_params<'a>(u: &'a [u8], ue: &'a [u8]) -> Params<'a> {
+        Params {
+            filter: "Standard",
+            v: 5,
+            r: 6,
+            length: 256,
+            o: &[],
+            u,
+            ue,
+            p: -4,
+            id: &[],
+            encrypt_metadata: true,
+            strings: Some("AESV3"),
+            streams: Some("AESV3"),
+        }
+    }
+
+    #[test]
+    fn metodo_desconocido_con_mensaje_fijo() {
+        let (u, ue) = (unhex(MUPDF_U), unhex(MUPDF_UE));
+        let raro = "<img src=x onerror=alert(1)>".repeat(1000);
+        let p = Params { streams: Some(&raro), ..mupdf_params(&u, &ue) };
+        assert_eq!(Crypt::new(&p).err().as_deref(), Some(METODO_DESCONOCIDO));
+        let p = Params { v: 99, ..mupdf_params(&u, &ue) };
+        assert!(!Crypt::new(&p).err().unwrap().contains("99"));
+    }
+
+    #[test]
+    fn combinaciones_incoherentes() {
+        let (u, ue) = (unhex(MUPDF_U), unhex(MUPDF_UE));
+        let base = mupdf_params(&u, &ue);
+        let casos = [
+            // Version 4 con AES-256, en cadenas o en flujos.
+            Params { v: 4, r: 4, ..mupdf_params(&u, &ue) },
+            Params { v: 4, r: 4, strings: Some("AESV2"), ..mupdf_params(&u, &ue) },
+            // Version 5 con RC4 o AES-128.
+            Params { streams: Some("V2"), ..mupdf_params(&u, &ue) },
+            Params { strings: Some("AESV2"), ..mupdf_params(&u, &ue) },
+            // Version 5 con una revision que no es 5 ni 6.
+            Params { r: 4, ..mupdf_params(&u, &ue) },
+        ];
+        for p in &casos {
+            assert_eq!(Crypt::new(p).err().as_deref(), Some(INCOHERENTE), "V {} R {} {:?}/{:?}", p.v, p.r, p.strings, p.streams);
+        }
+        // Version 5 con un filtro sin cifrar (Identity) sigue valiendo.
+        assert!(Crypt::new(&Params { strings: Some("Identity"), ..base }).is_ok());
+    }
+
+    #[test]
+    fn u_y_ue_cortos() {
+        let (u, ue) = (unhex(MUPDF_U), unhex(MUPDF_UE));
+        assert_eq!(Crypt::new(&mupdf_params(&u[..47], &ue)).err().as_deref(), Some(ILEGIBLE));
+        assert_eq!(Crypt::new(&mupdf_params(&u, &ue[..31])).err().as_deref(), Some(ILEGIBLE));
+        assert_eq!(Crypt::new(&mupdf_params(&[], &[])).err().as_deref(), Some(ILEGIBLE));
+    }
+
+    #[test]
+    fn datos_cortos_o_mal_rellenados() {
+        let (u, ue) = (unhex(MUPDF_U), unhex(MUPDF_UE));
+        let crypt = Crypt::new(&mupdf_params(&u, &ue)).unwrap();
+        let stream = unhex(MUPDF_STREAM);
+        // Menos de dos bloques (vector inicial y un bloque de datos): nada que descifrar.
+        for n in [0, 1, 16, 31] {
+            assert!(crypt.decrypt(crypt.streams, 6, 0, &stream[..n]).is_empty(), "{n} bytes");
+        }
+        // Un final incompleto se ignora; el resto se descifra igual.
+        let cortado = crypt.decrypt(crypt.streams, 6, 0, &stream[..stream.len() - 5]);
+        assert!(cortado.len() >= 48 && cortado.len() <= stream.len() - 32);
+        assert!(MUPDF_PLAIN.starts_with(&cortado));
+        // Relleno invalido (0 o mayor que 16): se entrega el bloque sin recortar, sin fallar.
+        let key = [7u8; 32];
+        let aes = Aes::new(&key).unwrap();
+        for ultimo in [0u8, 17, 255] {
+            let mut plano = [b'x'; 32];
+            plano[31] = ultimo;
+            let datos = [&[0u8; 16][..], &aes.cbc(&[0; 16], &plano, true)].concat();
+            assert_eq!(aes_cbc_decrypt(&key, &datos), plano, "relleno {ultimo}");
+        }
+        // Clave de largo invalido: vacio.
+        assert!(aes_cbc_decrypt(&[1; 20], &stream).is_empty());
+    }
+
+    #[test]
+    fn aes128_se_mantiene() {
+        let key: Vec<u8> = (0..16).collect();
+        let aes = Aes::new(&key).unwrap();
+        let datos = [&[3u8; 16][..], &aes.cbc(&[3; 16], &[[b'a'; 12].as_slice(), &[4; 4]].concat(), true)].concat();
+        assert_eq!(aes128_cbc_decrypt(&key, &datos), b"aaaaaaaaaaaa");
+        assert!(aes128_cbc_decrypt(&[0; 32], &datos).is_empty(), "solo claves de 16 bytes");
+    }
+
+    /// Prueba el cableado (diccionario /Encrypt indirecto, cadenas cifradas): el archivo se arma
+    /// con las funciones de este modulo. La conformidad con otra implementacion la prueba
+    /// `tests/cifrado.rs` con un PDF hecho por pypdf.
     #[test]
     fn pdf_aes256_revision_5() {
         let doc = crate::pdf::read(&pdf_revision_5(false)).unwrap();
