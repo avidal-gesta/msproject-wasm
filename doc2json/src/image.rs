@@ -4,8 +4,11 @@
 use crate::doc::{Image, Place};
 use std::collections::HashMap;
 
-/// Tope de imagenes distintas por documento: las siguientes no figuran en la lista.
+/// Tope de imagenes distintas por documento. Pasado el tope solo se registran las que miden al
+/// menos `MIN_SIDE_PAST_CAP` pixeles por lado, hasta el doble; las demas no figuran en la lista.
 pub const MAX_IMAGES: usize = 10_000;
+/// Lado menor, en pixeles, de una imagen que se registra aunque se haya pasado `MAX_IMAGES`.
+pub const MIN_SIDE_PAST_CAP: u32 = 32;
 /// Tope de lugares (veces que se dibujan) entre todas las imagenes del documento.
 pub const MAX_PLACES: usize = 100_000;
 /// Tope de bytes extraidos entre todas las imagenes del documento.
@@ -41,14 +44,23 @@ impl ImageSet {
     /// y ya se alcanzo el tope de imagenes.
     pub fn add(&mut self, key: &str, place: Option<Place>, alt: &str, make: impl FnOnce() -> Image) -> Option<u32> {
         let id = match self.index.get(key) {
+            // 0: una imagen que ya quedo fuera por los topes.
+            Some(&0) => return None,
             Some(&id) => id,
-            None if self.list.len() >= self.max_images => {
-                self.dropped_images += 1;
+            None if self.list.len() >= 2 * self.max_images => {
+                self.drop(key);
                 return None;
             }
             None => {
-                let id = self.list.len() as u32 + 1;
                 let mut img = make();
+                // Pasado el tope solo se registran las imagenes de cierto tamano: un PDF que arma
+                // una foto con miles de tiras de un pixel no deja fuera las imagenes de verdad.
+                let small = img.width.zip(img.height).is_none_or(|(w, h)| w.min(h) < MIN_SIDE_PAST_CAP);
+                if self.list.len() >= self.max_images && small {
+                    self.drop(key);
+                    return None;
+                }
+                let id = self.list.len() as u32 + 1;
                 img.id = id;
                 self.list.push(img);
                 self.keys.push(key.to_string());
@@ -71,11 +83,22 @@ impl ImageSet {
         Some(id)
     }
 
+    fn drop(&mut self, key: &str) {
+        self.dropped_images += 1;
+        self.index.insert(key.to_string(), 0);
+    }
+
     /// Avisos por lo que no se registro al llegar a los topes.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.dropped_images > 0 {
-            out.push(format!("El documento tiene mas de {} imagenes distintas: las siguientes no figuran en la lista.", self.max_images));
+            out.push(format!(
+                "El documento tiene mas de {} imagenes distintas: desde ahi solo figuran las de al menos {} pixeles por lado, hasta {}; {} no figuran en la lista.",
+                self.max_images,
+                MIN_SIDE_PAST_CAP,
+                2 * self.max_images,
+                self.dropped_images
+            ));
         }
         if self.dropped_places > 0 {
             out.push(format!("Las imagenes se dibujan mas de {} veces: {} lugares no figuran en la lista.", self.max_places, self.dropped_places));
@@ -307,6 +330,16 @@ mod tests {
         assert_eq!(set.add("a", p(), "", make), Some(1));
         assert_eq!((set.list.len(), set.list[0].places.len()), (2, 2));
         assert_eq!(set.warnings().len(), 2);
+        // Pasado el tope, las de cierto tamano siguen entrando, hasta el doble; la que quedo fuera
+        // sigue fuera aunque se vuelva a dibujar.
+        let big = || Image { width: Some(64), height: Some(40), ..Image::default() };
+        let thin = || Image { width: Some(640), height: Some(1), ..Image::default() };
+        assert_eq!(set.add("d", None, "", thin), None);
+        assert_eq!(set.add("e", None, "", big), Some(3));
+        assert_eq!(set.add("f", None, "", big), Some(4));
+        assert_eq!(set.add("g", None, "", big), None);
+        assert_eq!(set.add("c", None, "", big), None);
+        assert!(set.warnings()[0].contains("3 no figuran"), "{:?}", set.warnings());
 
         let mut budget = Budget::new(10);
         let (mut x, mut y, mut z) = (Image::default(), Image::default(), Image::default());

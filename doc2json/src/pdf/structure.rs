@@ -784,7 +784,7 @@ mod tests {
         for (i, (m, t)) in textos.iter().enumerate() {
             let y = 700.0 - 14.0 * i as f64;
             let w = 5.0 * t.chars().count() as f64;
-            by_mcid.entry(*m).or_default().push(Item { text: t.to_string(), x0: 72.0, y0: y, x1: 72.0 + w, y1: y, size: 10.0, dx: 1.0, dy: 0.0, bold: false, mcid: Some(*m), artifact: false, art: 0, scope: 0 });
+            by_mcid.entry(*m).or_default().push(Item { text: t.to_string(), x0: 72.0, y0: y, x1: 72.0 + w, y1: y, size: 10.0, tail: 0.0, dx: 1.0, dy: 0.0, bold: false, mcid: Some(*m), artifact: false, art: 0, scope: 0 });
         }
         vec![PageStore { bbox: [0.0, 0.0, 612.0, 792.0], rotate: 0, by_mcid }]
     }

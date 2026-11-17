@@ -3,7 +3,7 @@
 
 use super::document::Pdf;
 use super::font::Font;
-use super::object::{is_ws, Dict, Lexer, Obj};
+use super::object::{is_delim, is_ws, Dict, Lexer, Obj};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -34,6 +34,9 @@ pub struct Item {
     pub y1: f64,
     /// Tamano de letra efectivo, en puntos.
     pub size: f64,
+    /// Parte del avance del ultimo glifo que es espaciado (`Tc`, y `Tw` en un espacio), en puntos
+    /// a lo largo de la linea: el glifo visible termina antes de `x1`.
+    pub tail: f64,
     /// Direccion de escritura (vector unitario).
     pub dx: f64,
     pub dy: f64,
@@ -122,15 +125,107 @@ pub struct Interp<'p, 'a> {
     overflow: usize,
     /// Numero del ultimo artefacto abierto.
     scopes: u32,
+    /// Huecos dudosos del tramo actual (posicion en el texto y ancho relativo al tamano de letra):
+    /// mas anchos que el apretado entre letras pero menos que un espacio comun.
+    doubt: Vec<(usize, f64)>,
+    /// Uniones apretadas entre glifos del tramo actual.
+    tight: usize,
+    /// Huecos (relativos al tamano de letra) que ya pusieron un espacio en el tramo actual.
+    inserted: Vec<f64>,
+    /// Donde empieza el ultimo glifo del tramo actual.
+    glyph: (f64, f64),
+    /// El ultimo glifo del tramo actual es una ligadura (fi, fl, ff...).
+    ligature: bool,
 }
+
+/// Un glifo que da varias letras de una ligadura tipografica, o la ligadura misma.
+fn is_ligature(text: &str) -> bool {
+    matches!(text, "ff" | "fi" | "fl" | "ffi" | "ffl" | "ft" | "st") || text.chars().any(|c| ('\u{FB00}'..='\u{FB06}').contains(&c))
+}
+
+/// Las ligaduras latinas de Unicode (U+FB00 a U+FB06) como sus letras.
+fn unligature(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    for c in text.chars() {
+        match c {
+            '\u{FB00}' => out.push_str("ff"),
+            '\u{FB01}' => out.push_str("fi"),
+            '\u{FB02}' => out.push_str("fl"),
+            '\u{FB03}' => out.push_str("ffi"),
+            '\u{FB04}' => out.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Desde este hueco (relativo al tamano de letra) hay un espacio entre palabras.
+const WORD_GAP: f64 = 0.15;
+/// Huecos entre este valor y `WORD_GAP` son dudosos: en una linea justificada apretada son
+/// espacios; sueltos, suelen ser letras mal ubicadas de una exportacion.
+const DOUBT_GAP: f64 = 0.09;
+/// Hasta aqui una union entre glifos es apretada (pegados o con un ajuste de interletra).
+const TIGHT_GAP: f64 = 0.05;
 
 fn num(o: Option<&Obj>) -> f64 {
     o.and_then(|v| v.as_f64()).unwrap_or(0.0)
 }
 
+/// Un caracter que forma parte de un operador o un nombre (ni espacio ni delimitador).
+fn is_regular(b: u8) -> bool {
+    !is_ws(b) && !is_delim(b)
+}
+
+/// Los operadores que el interprete usa (texto, matrices, estado, formularios, contenido marcado
+/// e imagenes incrustadas). Los demas solo consumen sus argumentos.
+fn text_op(w: &[u8]) -> Option<&'static str> {
+    Some(match w {
+        b"BT" => "BT",
+        b"Tf" => "Tf",
+        b"Td" => "Td",
+        b"TD" => "TD",
+        b"Tm" => "Tm",
+        b"T*" => "T*",
+        b"Tc" => "Tc",
+        b"Tw" => "Tw",
+        b"Tz" => "Tz",
+        b"TL" => "TL",
+        b"Ts" => "Ts",
+        b"Tj" => "Tj",
+        b"'" => "'",
+        b"\"" => "\"",
+        b"TJ" => "TJ",
+        b"cm" => "cm",
+        b"q" => "q",
+        b"Q" => "Q",
+        b"Do" => "Do",
+        b"BMC" => "BMC",
+        b"BDC" => "BDC",
+        b"EMC" => "EMC",
+        b"BI" => "BI",
+        _ => return None,
+    })
+}
+
+/// Un numero de un flujo de contenido, como lo lee `Lexer` (tolera signos repetidos, "--5").
+fn number(raw: &[u8]) -> Obj {
+    let raw = std::str::from_utf8(raw).unwrap_or("0");
+    let negative = raw.starts_with('-');
+    let digits = raw.trim_start_matches(['+', '-']);
+    let sign = |v: f64| if negative { -v } else { v };
+    if digits.contains('.') {
+        return Obj::Real(sign(digits.parse().unwrap_or(0.0)));
+    }
+    match digits.parse::<i64>() {
+        Ok(v) => Obj::Int(if negative { -v } else { v }),
+        Err(_) => Obj::Real(sign(digits.parse().unwrap_or(0.0))),
+    }
+}
+
 impl<'p, 'a> Interp<'p, 'a> {
     pub fn new(pdf: &'p Pdf<'a>, fonts: &'p FontCache) -> Interp<'p, 'a> {
-        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000, marked: Vec::new(), overflow: 0, scopes: 0 }
+        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000, marked: Vec::new(), overflow: 0, scopes: 0, doubt: Vec::new(), tight: 0, inserted: Vec::new(), glyph: (0.0, 0.0), ligature: false }
     }
 
     /// Cierra el contenido marcado que haya quedado abierto (antes de las anotaciones, que van aparte).
@@ -207,18 +302,12 @@ impl<'p, 'a> Interp<'p, 'a> {
     }
 
     fn font(&self, resources: &Dict, name: &str) -> Option<Rc<Font>> {
-        let fonts = self.pdf.dict(resources, "Font")?;
-        let entry = fonts.get(name)?;
-        let key = match entry {
-            Obj::Ref(n, _) => Some(*n),
-            _ => None,
-        };
+        let (obj, key) = self.pdf.sub_entry(resources, "Font", name)?;
         if let Some(k) = key {
             if let Some(f) = self.fonts.borrow().get(&k) {
                 return Some(f.clone());
             }
         }
-        let obj = self.pdf.resolve(entry);
         let font = Rc::new(Font::load(self.pdf, obj.as_dict()?));
         if let Some(k) = key {
             self.fonts.borrow_mut().insert(k, font.clone());
@@ -227,7 +316,23 @@ impl<'p, 'a> Interp<'p, 'a> {
     }
 
     fn flush(&mut self) {
-        if let Some(item) = self.cur.take() {
+        let doubt = std::mem::take(&mut self.doubt);
+        let tight = std::mem::replace(&mut self.tight, 0);
+        let inserted = std::mem::take(&mut self.inserted);
+        if let Some(mut item) = self.cur.take() {
+            // Una linea justificada que separa las palabras solo por su posicion (sin caracteres
+            // de espacio; los que hay los puso un hueco ancho) puede apretarlas por debajo del espacio comun. Sus huecos son casi
+            // iguales entre si y las letras de cada palabra van juntas; un hueco dudoso suelto,
+            // o letras todas separadas (interletra amplia), no son espacios.
+            if doubt.len() >= 3 && item.text.matches(' ').count() == inserted.len() && tight >= 2 * doubt.len() {
+                let (lo, hi) = doubt.iter().fold((f64::MAX, 0.0f64), |(lo, hi), d| (lo.min(d.1), hi.max(d.1)));
+                // Los espacios que ya hay, de la misma familia: la linea entera va justificada igual.
+                if hi <= lo * 1.15 && inserted.iter().all(|g| *g <= hi * 1.15) {
+                    for (pos, _) in doubt.iter().rev() {
+                        item.text.insert(*pos, ' ');
+                    }
+                }
+            }
             if !item.text.trim().is_empty() {
                 self.out.items.push(item);
             }
@@ -251,10 +356,13 @@ impl<'p, 'a> Interp<'p, 'a> {
         let size = (st.size * uy).abs();
         let (mut ox, mut oy) = (m[4] + st.ts * m[2], m[5] + st.ts * m[3]);
         let mut total = 0.0f64;
-        let mut glyphs: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+        let mut glyphs: Vec<(String, f64, f64, f64, f64, f64)> = Vec::new();
         let mut unmapped = 0usize;
         font.decode(bytes, |text, w, is_space| {
-            let adv = (w * st.size + st.tc + if is_space { st.tw } else { 0.0 }) * st.th;
+            let spacing = (st.tc + if is_space { st.tw } else { 0.0 }) * st.th;
+            let adv = w * st.size * st.th + spacing;
+            // El espaciado en puntos de pagina (la matriz puede escalar el texto).
+            let tail = (spacing * ux).max(0.0);
             let (ex, ey) = (ox + adv * m[0], oy + adv * m[1]);
             if text == "\u{FFFD}" {
                 unmapped += 1;
@@ -263,10 +371,13 @@ impl<'p, 'a> Interp<'p, 'a> {
             if text.bytes().any(|b| b < 0x20) {
                 let clean: String = text.chars().filter(|c| !c.is_control()).collect();
                 if !clean.is_empty() {
-                    glyphs.push((clean, ox, oy, ex, ey));
+                    glyphs.push((clean, ox, oy, ex, ey, tail));
                 }
+            } else if text.chars().any(|c| ('\u{FB00}'..='\u{FB06}').contains(&c)) {
+                // Las ligaduras tipograficas como letras sueltas: "ﬁ" no coincide con "fi" al buscar.
+                glyphs.push((unligature(text), ox, oy, ex, ey, tail));
             } else if !text.is_empty() {
-                glyphs.push((text.to_string(), ox, oy, ex, ey));
+                glyphs.push((text.to_string(), ox, oy, ex, ey, tail));
             }
             ox = ex;
             oy = ey;
@@ -277,21 +388,48 @@ impl<'p, 'a> Interp<'p, 'a> {
         tm[5] += total * tm[1];
 
         let mk = self.marked_now();
-        for (text, sx, sy, ex, ey) in glyphs {
+        for (text, sx, sy, ex, ey, tail) in glyphs {
             if let Some(cur) = self.cur.as_mut() {
                 // Distancia del nuevo glifo al final del tramo, a lo largo y a traves de la linea.
-                let along = (sx - cur.x1) * cur.dx + (sy - cur.y1) * cur.dy;
+                let mut along = (sx - cur.x1) * cur.dx + (sy - cur.y1) * cur.dy;
+                // Un glifo ubicado aparte (`Td`, `Tm`) dentro del espaciado del anterior: quien
+                // escribio el PDF declaro un `Tc` que no usa y ubica cada letra donde termina la
+                // anterior. Se mide desde el final visible del glifo, no desde su avance.
+                if along < -0.3 * size {
+                    // Avance desde el comienzo del glifo anterior.
+                    let forward = (sx - self.glyph.0) * cur.dx + (sy - self.glyph.1) * cur.dy;
+                    if along + cur.tail >= -0.3 * size {
+                        along += cur.tail;
+                    } else if forward > 0.2 * size && forward < 1.2 * size {
+                        // Anchos de la fuente mayores que los glifos reales: cada letra, ubicada
+                        // aparte, parece montarse en la anterior aunque avanza. Va pegada a ella.
+                        along = 0.0;
+                    }
+                }
                 let across = (-(sx - cur.x1) * cur.dy + (sy - cur.y1) * cur.dx).abs();
                 // Un tramo no mezcla contenido marcado distinto: cada uno pertenece a otro elemento.
                 let same = across < 0.2 * size && (size - cur.size).abs() < 0.08 * size.max(cur.size) && cur.dx * dx + cur.dy * dy > 0.98 && cur.bold == font.bold && cur.mcid == mk.mcid && cur.artifact == mk.artifact && cur.art == mk.art;
                 if same && along > -0.3 * size && along < 1.2 * size {
+                    // Un espacio dibujado dentro del glifo anterior no separa nada (algunos
+                    // programas lo agregan tras una ligadura); un espacio de verdad avanza.
+                    if text.trim().is_empty() && along < -WORD_GAP * size && self.ligature {
+                        continue;
+                    }
                     // Un hueco mayor que un apretado entre letras es un espacio entre palabras.
-                    if along > 0.15 * size && !cur.text.ends_with(' ') && !text.starts_with(' ') {
+                    if along > WORD_GAP * size && !cur.text.ends_with(' ') && !text.starts_with(' ') {
                         cur.text.push(' ');
+                        self.inserted.push(along / size);
+                    } else if along > DOUBT_GAP * size && !cur.text.ends_with(' ') && !text.starts_with(' ') {
+                        self.doubt.push((cur.text.len(), along / size));
+                    } else if along.abs() <= TIGHT_GAP * size {
+                        self.tight += 1;
                     }
                     cur.text.push_str(&text);
                     cur.x1 = ex;
                     cur.y1 = ey;
+                    cur.tail = tail;
+                    self.glyph = (sx, sy);
+                    self.ligature = is_ligature(&text);
                     // Dos artefactos seguidos en la misma linea forman un tramo; queda el ambito del
                     // ultimo, asi un artefacto sin cerrar devuelve el tramo entero al contenido.
                     cur.scope = mk.scope;
@@ -302,7 +440,9 @@ impl<'p, 'a> Interp<'p, 'a> {
             if text.trim().is_empty() {
                 continue; // un tramo no empieza con espacios
             }
-            self.cur = Some(Item { text, x0: sx, y0: sy, x1: ex, y1: ey, size, dx, dy, bold: font.bold, mcid: mk.mcid, artifact: mk.artifact, art: mk.art, scope: mk.scope });
+            self.glyph = (sx, sy);
+            self.ligature = is_ligature(&text);
+            self.cur = Some(Item { text, x0: sx, y0: sy, x1: ex, y1: ey, size, tail, dx, dy, bold: font.bold, mcid: mk.mcid, artifact: mk.artifact, art: mk.art, scope: mk.scope });
         }
     }
 
@@ -318,24 +458,78 @@ impl<'p, 'a> Interp<'p, 'a> {
     fn exec(&mut self, content: &[u8], resources: &Dict, st: &mut State) {
         let mut lx = Lexer::new(content, 0);
         let mut args: Vec<Obj> = Vec::new();
+        // Numeros de `args` aun sin convertir (posicion en `args`, inicio y fin en el flujo): un
+        // dibujo vectorial trae millones, y solo los de los operadores de texto hacen falta.
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
         let mut saved: Vec<State> = Vec::new();
         let mut tm = IDENTITY;
         let mut tlm = IDENTITY;
-        while let Some(o) = lx.object() {
-            let op = match o {
-                Obj::Op(op) => op,
-                other => {
-                    if args.len() < 256 {
-                        args.push(other);
+        let mut owned = String::new();
+        loop {
+            lx.skip_ws();
+            let b = match lx.peek() {
+                Some(b) => b,
+                None => break,
+            };
+            let op: &str = if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
+                let start = lx.pos;
+                while matches!(lx.peek(), Some(b'+' | b'-' | b'.' | b'0'..=b'9')) {
+                    lx.pos += 1;
+                }
+                if args.len() < 256 {
+                    spans.push((args.len(), start, lx.pos));
+                    args.push(Obj::Null);
+                }
+                continue;
+            } else if is_regular(b) {
+                // Un operador: los que no se usan para el texto (trazos, colores) se descartan
+                // sin armar nada.
+                let start = lx.pos;
+                while lx.peek().is_some_and(is_regular) {
+                    lx.pos += 1;
+                }
+                match text_op(&content[start..lx.pos]) {
+                    Some(op) => op,
+                    None => {
+                        match &content[start..lx.pos] {
+                            b"true" => args.push(Obj::Bool(true)),
+                            b"false" => args.push(Obj::Bool(false)),
+                            b"null" => args.push(Obj::Null),
+                            _ => {
+                                if self.budget == 0 {
+                                    break;
+                                }
+                                self.budget -= 1;
+                                args.clear();
+                                spans.clear();
+                            }
+                        }
+                        continue;
                     }
-                    continue;
+                }
+            } else {
+                match lx.object() {
+                    Some(Obj::Op(op)) => {
+                        owned = op;
+                        owned.as_str()
+                    }
+                    Some(other) => {
+                        if args.len() < 256 {
+                            args.push(other);
+                        }
+                        continue;
+                    }
+                    None => break,
                 }
             };
             if self.budget == 0 {
                 break;
             }
             self.budget -= 1;
-            match op.as_str() {
+            for (k, a, z) in spans.drain(..) {
+                args[k] = number(&content[a..z]);
+            }
+            match op {
                 "BT" => {
                     tm = IDENTITY;
                     tlm = IDENTITY;
@@ -463,13 +657,13 @@ impl<'p, 'a> Interp<'p, 'a> {
             }
             args.clear();
         }
+        let _ = owned;
     }
 
     fn xobject(&mut self, resources: &Dict, name: &str, st: &State) {
         // Sin copiar el diccionario de recursos: se dibujan muchas veces.
-        let xobjects = self.pdf.get(resources, "XObject");
-        let (obj, key) = match xobjects.as_dict().and_then(|x| x.get(name)) {
-            Some(o) => (self.pdf.resolve(o), if let Obj::Ref(n, _) = o { Some(*n) } else { None }),
+        let (obj, key) = match self.pdf.sub_entry(resources, "XObject", name) {
+            Some(e) => e,
             None => return,
         };
         let dict = match obj.as_dict() {

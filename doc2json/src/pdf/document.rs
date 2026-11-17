@@ -505,6 +505,17 @@ impl<'a> Pdf<'a> {
         }
     }
 
+    /// La entrada `name` del diccionario guardado en `d[key]` (escrito ahi o por referencia), sin
+    /// copiar ese diccionario: un `/XObject` con miles de imagenes se consulta en cada `Do`. Da el
+    /// objeto resuelto y su numero si la entrada era una referencia.
+    pub fn sub_entry(&self, d: &Dict, key: &str, name: &str) -> Option<(Rc<Obj>, Option<u32>)> {
+        let entry = |x: &Dict| x.get(name).map(|o| (self.resolve(o), if let Obj::Ref(n, _) = o { Some(*n) } else { None }));
+        match d.get(key)? {
+            Obj::Dict(x) => entry(x),
+            other => self.resolve(other).as_dict().and_then(entry),
+        }
+    }
+
     pub fn dict(&self, d: &Dict, key: &str) -> Option<Dict> {
         self.get(d, key).as_dict().cloned()
     }

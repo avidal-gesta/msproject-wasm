@@ -34,19 +34,86 @@ impl Bits<'_> {
     }
 
     fn align(&mut self) {
+        // Los bytes enteros que se cargaron por adelantado vuelven al flujo; los bits sueltos del
+        // byte en curso se descartan.
+        self.pos -= (self.n / 8) as usize;
         self.acc = 0;
         self.n = 0;
     }
+
+    /// Carga bits hasta tener `count` o acabar los datos, sin consumirlos.
+    #[inline]
+    fn fill(&mut self, count: u32) {
+        while self.n < count {
+            match self.d.get(self.pos) {
+                Some(&b) => {
+                    self.pos += 1;
+                    self.acc |= (b as u32) << self.n;
+                    self.n += 8;
+                }
+                None => break,
+            }
+        }
+    }
 }
+
+/// Bits que resuelve la tabla rapida de un codigo Huffman; los codigos mas largos (raros) se leen
+/// bit a bit.
+const FAST_BITS: u32 = 10;
 
 /// Tabla de codigos Huffman canonicos: cantidad de codigos por longitud y simbolos en orden.
 struct Huffman {
     count: [u16; 16],
     symbol: Vec<u16>,
+    /// Por los proximos `FAST_BITS` bits del flujo: simbolo << 4 | largo del codigo (0 = el codigo
+    /// es mas largo, o no existe). Vacia si los largos no forman un codigo valido.
+    fast: Vec<u16>,
 }
 
 impl Huffman {
     fn new(lengths: &[u8]) -> Huffman {
+        let mut h = Huffman::canonical(lengths);
+        // Con un codigo sobresuscrito (datos danados) se decodifica siempre bit a bit, igual que antes.
+        let mut left = 1i32;
+        for len in 1..16 {
+            left = (left << 1) - h.count[len] as i32;
+            if left < 0 {
+                return h;
+            }
+        }
+        let mut next = [0u32; 16];
+        let mut code = 0u32;
+        for len in 1..16 {
+            code = (code + h.count[len - 1] as u32) << 1;
+            next[len] = code;
+        }
+        let mut fast = vec![0u16; 1 << FAST_BITS];
+        for (sym, &l) in lengths.iter().enumerate() {
+            let l = (l & 15) as u32;
+            if l == 0 {
+                continue;
+            }
+            let c = next[l as usize];
+            next[l as usize] += 1;
+            if l > FAST_BITS || sym > 0xFFF {
+                continue;
+            }
+            // El primer bit leido es el mas significativo del codigo: en el acumulador va al reves.
+            let mut rev = 0u32;
+            for i in 0..l {
+                rev |= ((c >> i) & 1) << (l - 1 - i);
+            }
+            let mut k = rev;
+            while k < (1 << FAST_BITS) {
+                fast[k as usize] = (sym as u16) << 4 | l as u16;
+                k += 1 << l;
+            }
+        }
+        h.fast = fast;
+        h
+    }
+
+    fn canonical(lengths: &[u8]) -> Huffman {
         let mut count = [0u16; 16];
         for &l in lengths {
             count[(l & 15) as usize] += 1;
@@ -66,11 +133,21 @@ impl Huffman {
                 *o += 1;
             }
         }
-        Huffman { count, symbol }
+        Huffman { count, symbol, fast: Vec::new() }
     }
 
     #[inline]
     fn decode(&self, b: &mut Bits) -> Option<u16> {
+        if !self.fast.is_empty() {
+            b.fill(FAST_BITS);
+            let e = self.fast[(b.acc & ((1 << FAST_BITS) - 1)) as usize];
+            let l = (e & 15) as u32;
+            if l != 0 && l <= b.n {
+                b.acc >>= l;
+                b.n -= l;
+                return Some(e >> 4);
+            }
+        }
         let mut code = 0i32;
         let mut first = 0i32;
         let mut index = 0i32;
@@ -138,9 +215,14 @@ fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, cap: us
             }
             let start = out.len() - distance;
             fit(out, len, cap, cut, |o, k| {
-                for i in 0..k {
-                    let v = o[start + i];
-                    o.push(v);
+                if distance >= k {
+                    // Sin solaparse con lo que se va agregando: se copia de una vez.
+                    o.extend_from_within(start..start + k);
+                } else {
+                    for i in 0..k {
+                        let v = o[start + i];
+                        o.push(v);
+                    }
                 }
             })?;
         }
