@@ -2,7 +2,7 @@
 //! bloques de contenido (titulos, parrafos, items de lista y tablas).
 //!
 //! Limites: no hace OCR (una pagina escaneada no tiene texto que extraer) y no abre PDF
-//! cifrados con contrasena.
+//! que piden contrasena para abrirse.
 
 pub mod content;
 pub mod crypt;

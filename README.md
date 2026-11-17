@@ -156,7 +156,7 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 - **Listas** por su viñeta o numeración inicial.
 - Páginas a dos columnas de texto corrido: se lee primero la columna izquierda.
 - Incluye el texto de **firmas digitales, sellos y campos de formulario**, que no está en el contenido de la página sino en anotaciones.
-- Abre PDF "protegidos" contra edición o copia (cifrado RC4 y AES-128 sin contraseña de apertura).
+- Abre PDF "protegidos" contra edición o copia (cifrado RC4, AES-128 y AES-256 sin contraseña de apertura).
 - Si el índice interno del archivo está dañado, lo reconstruye recorriendo el archivo.
 
 ### PowerPoint (.pptx)
@@ -454,7 +454,7 @@ node web/prueba.mjs
 - En PDF sin etiquetas la estructura es una deducción. Funciona bien en documentos de oficina, informes y certificados; puede equivocarse con diseños muy libres (afiches, planos, revistas a varias columnas con recuadros).
 - En PDF sin etiquetas las tablas se detectan por alineación del texto, no por sus líneas dibujadas. Una tabla con celdas de varias líneas puede salir partida en más filas.
 - En PDF etiquetado vale lo que diga el etiquetado. Word no exporta las combinaciones verticales de celdas (`RowSpan`), así que esas celdas salen vacías en vez de `merged`. No se leen las etiquetas de formularios incrustados (`/Stm`) ni las anotaciones referidas desde el árbol (`OBJR`): su texto igual se recupera por posición.
-- No abre PDF con cifrado AES-256 ni los que piden contraseña para abrirse: da un mensaje claro.
+- No abre los PDF que piden contraseña para abrirse ni los protegidos con certificados o DRM: da un mensaje claro.
 - Si un PDF usa fuentes sin tabla de caracteres, ese texto es ilegible para cualquier extractor (también al copiar y pegar desde un visor).
 - En PDF las imágenes no se insertan en `content` (que se deduce del texto): se ubican con `places`.
 - Los PNG se comprimen con códigos Huffman fijos: una imagen sin compresión en el PDF puede quedar más pesada que con un compresor completo. Las fotografías suelen venir como JPEG, que se entrega tal cual.
@@ -481,7 +481,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 **doc2json, PDF** contra PyMuPDF
 
 - 227 PDF elegidos por variedad de programa de origen (Word, Excel, Crystal Reports, LibreOffice, iText, wkhtmltopdf, Chrome, escáneres…), 794 páginas: coincide el 99,5 % de las palabras y falta el 0,3 % de los caracteres. Lo que falta está en fuentes sin tabla de caracteres, donde la referencia también devuelve texto ilegible.
-- Descifrado probado con RC4 de 40 y 128 bits y AES-128, con y sin flujos de objetos: mismo texto que el original.
+- Descifrado probado con RC4 de 40 y 128 bits, AES-128 y AES-256 (revisiones 5 y 6), con y sin flujos de objetos: mismo texto que el original. 150 PDF reales guardados por MuPDF sin cifrar, con AES-128 y con AES-256 dan exactamente el mismo JSON.
 - Páginas apaisadas y rotadas (90°, 180°, 270°) y texto a dos columnas: mismo orden de lectura que la referencia.
 
 **doc2json, PowerPoint y Excel** contra python-pptx y openpyxl
@@ -529,7 +529,7 @@ doc2json/src/           doc2json
     object.rs           objetos de PDF y su analizador
     document.rs         tabla de referencias, objetos, páginas, metadatos
     filters.rs          filtros de flujos (Flate, LZW, ASCII85, predictores…)
-    crypt.rs            MD5, RC4, AES-128 y manejador de seguridad estándar
+    crypt.rs            MD5, SHA-2, RC4, AES-128/256 y manejador de seguridad estándar
     encoding.rs         codificaciones y nombres de glifos
     font.rs             fuentes y tablas ToUnicode
     content.rs          intérprete del contenido de página (incluido el contenido marcado)

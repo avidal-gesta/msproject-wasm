@@ -142,7 +142,7 @@ impl<'a> Pdf<'a> {
         };
         let (strf, stmf) = (method_of("StrF"), method_of("StmF"));
         let filter = self.name(enc, "Filter").unwrap_or_default();
-        let (o, u) = (bytes("O"), bytes("U"));
+        let (o, u, ue) = (bytes("O"), bytes("U"), bytes("UE"));
         let params = Params {
             filter: &filter,
             v: int("V", 0),
@@ -150,6 +150,7 @@ impl<'a> Pdf<'a> {
             length: int("Length", 40),
             o: &o,
             u: &u,
+            ue: &ue,
             p: int("P", 0),
             id: &id,
             encrypt_metadata: !matches!(&*self.get(enc, "EncryptMetadata"), Obj::Bool(false)),
