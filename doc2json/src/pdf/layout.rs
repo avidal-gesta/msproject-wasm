@@ -439,7 +439,7 @@ mod tests {
     use super::*;
 
     fn item(text: &str, x: f64, y: f64, w: f64) -> Item {
-        Item { text: text.into(), x0: x, y0: y, x1: x + w, y1: y, size: 10.0, dx: 1.0, dy: 0.0, bold: false, mcid: None, artifact: false, art: 0 }
+        Item { text: text.into(), x0: x, y0: y, x1: x + w, y1: y, size: 10.0, dx: 1.0, dy: 0.0, bold: false, mcid: None, artifact: false, art: 0, scope: 0 }
     }
 
     #[test]

@@ -142,9 +142,11 @@ fn visible_chars(items: &[content::Item]) -> usize {
 }
 
 /// Bloques desde el arbol de estructura, con el texto que no quedo en ningun elemento agregado
-/// (por posicion) despues de los bloques de su pagina. `None` si la estructura no sirve.
-fn tagged_blocks(tree: &structure::Node, stores: &[structure::PageStore], unmarked: &[Vec<content::Item>], body: f64, sizes: &[f64]) -> Option<(Vec<crate::doc::Block>, Vec<crate::doc::Block>)> {
-    let mut b = structure::Builder { pages: stores, used: HashSet::new(), notes: Vec::new() };
+/// (por posicion) despues de los bloques de su pagina, las notas al pie y los avisos. `None` si
+/// la estructura no sirve.
+type Tagged = (Vec<crate::doc::Block>, Vec<crate::doc::Block>, Vec<String>);
+fn tagged_blocks(tree: &structure::Node, stores: &[structure::PageStore], unmarked: &[Vec<content::Item>], body: f64, sizes: &[f64]) -> Option<Tagged> {
+    let mut b = structure::Builder::new(stores);
     let mut blocks = Vec::new();
     b.walk(tree, &mut blocks);
     let total: usize = stores.iter().flat_map(|s| s.by_mcid.values()).map(|v| visible_chars(v)).sum::<usize>() + unmarked.iter().map(|v| visible_chars(v)).sum::<usize>();
@@ -171,7 +173,7 @@ fn tagged_blocks(tree: &structure::Node, stores: &[structure::PageStore], unmark
         let at = blocks.iter().rposition(|x| x.page.map_or(false, |p| p <= page)).map_or(0, |k| k + 1);
         blocks.splice(at..at, extra);
     }
-    Some((blocks, b.notes))
+    Some((blocks, b.notes, b.warnings))
 }
 
 /// Encabezados y pies de un PDF etiquetado (artefactos de paginacion), como `headers` y `footers`
@@ -351,8 +353,9 @@ pub fn read_opts(bytes: &[u8], tags: bool, extract: bool) -> Result<Document, St
     let page_index0: HashMap<u32, usize> = pages.iter().enumerate().filter(|(_, p)| p.obj != 0).map(|(i, p)| (p.obj, i)).collect();
     let tagged = if tags { structure::tree(&pdf, &page_index0).and_then(|tree| tagged_blocks(&tree, &stores, &unmarked, body, &sizes)) } else { None };
     match tagged {
-        Some((blocks, notes)) => {
+        Some((blocks, notes, warnings)) => {
             doc.content = blocks;
+            doc.warnings.extend(warnings);
             let (headers, footers) = running_texts(&arts, &stores);
             for (key, list) in [("headers", headers), ("footers", footers), ("footnotes", notes)] {
                 if !list.is_empty() {

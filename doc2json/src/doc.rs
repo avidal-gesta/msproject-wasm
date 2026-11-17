@@ -395,7 +395,9 @@ fn to_json_at(d: &Document, full: bool, at: &dyn Fn(&Image) -> Option<(usize, us
         .int("paragraphs", count(Kind::Paragraph))
         .int("list_items", count(Kind::ListItem))
         .int("tables", count(Kind::Table))
-        .int("images", count(Kind::Image) + d.pages.iter().map(|p| p.images as i64).sum::<i64>());
+        // En PDF las imagenes son las que dibujan las paginas: un bloque de imagen (figura de un PDF
+        // etiquetado) es una de ellas y no se suma otra vez.
+        .int("images", if d.pages.is_empty() { count(Kind::Image) } else { d.pages.iter().map(|p| p.images as i64).sum::<i64>() });
 
     let mut root = Obj::new();
     root.str("type", d.kind).raw("metadata", &meta.end());

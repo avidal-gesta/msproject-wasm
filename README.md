@@ -141,10 +141,13 @@ Y como **fragmentos** listos para indexar o enviar a un modelo (`--fragmentos[=N
 
 - **Tablas** con sus filas y celdas reales, aunque una celda ocupe varias líneas; las celdas combinadas (`RowSpan`/`ColSpan`) dejan su lugar marcado con `merged` en las filas de abajo, igual que en Word.
 - **Títulos** con su nivel (`H1`…`H6`, `Title`), **listas** con su viñeta o numeración (`Lbl`) y las anidadas un nivel más adentro, y **figuras** con su texto alternativo.
-- **Notas al pie**: la cita queda en el texto como `[1]` y la nota va en `footnotes`, como en Word.
-- Los **encabezados, pies y números de página** vienen marcados como artefactos: quedan fuera del contenido y van en `headers` y `footers`, como en Word, una vez cada texto aunque se repita en todas las páginas (siguen también en el texto de cada página).
+- **Orden de lectura**: el del árbol (`/K`), aunque un párrafo cruce de columna o de página. La posición solo arma las líneas: las de cada contenido marcado y las que comparten contenidos seguidos (un subíndice, un enlace o una letra en negrita en medio de una palabra).
+- **Notas al pie**: la cita queda en el texto como `[1]` y la nota va en `footnotes`, como en Word. El rótulo de la nota es su `Lbl` o, si no lo trae, el número o símbolo con que empieza su texto («Ver anexo 2» no tiene rótulo).
+- Los **encabezados, pies y números de página** vienen marcados como artefactos: quedan fuera del contenido y van en `headers` y `footers`, como en Word, una vez cada texto aunque se repita en todas las páginas (siguen también en el texto de cada página). Un artefacto que no se cierra (`BMC`/`BDC` sin su `EMC`) no se lleva el resto de la página: lo que quedó dentro vuelve a ser contenido.
 - El texto que no pertenece a ningún elemento (firmas, contenido sin etiquetar) se agrega por posición después de los bloques de su página, para no perder nada. Si el árbol cubre menos de la mitad del texto, se usa el método por posición para todo el documento.
 - `metadata.tagged` vale `true` cuando la estructura salió de las etiquetas.
+
+Límites ante árboles dañados o malintencionados: 500.000 elementos y contenidos marcados, 64 niveles de elementos y 8 arreglos o referencias encadenados entre un elemento y sus hijos (los ciclos se cortan). Una tabla de más de 1.000 columnas o 200.000 celdas, contando el relleno de las combinadas, o que pase de 1.000.000 de celdas sumando todas las del documento, sale como párrafos y con un aviso en `warnings`.
 
 Con el `ejemplo/` de este repositorio, los bloques del PDF etiquetado son idénticos a los del `.docx` original (prueba `pdf_etiquetado_igual_al_docx`).
 
