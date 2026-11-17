@@ -365,6 +365,9 @@ fn image_bytes(w: u32, h: u32, comps: usize, bpc: u8) -> Option<usize> {
 fn enough(len: usize, need: Option<usize>) -> Result<usize, String> {
     match need {
         Some(n) if len >= n - n / 2 => Ok(n),
+        // Las imagenes se decodifican despues del texto: el limite de descompresion del documento
+        // puede haberse agotado antes. No es un archivo danado, y la nota lo dice.
+        Some(n) if crate::budget::decompressed_hit() => Err(format!("No se extrajo: se alcanzo el limite de datos descomprimidos del documento ({} de {} bytes).", len, n)),
         Some(n) => Err(format!("Los datos de la imagen estan incompletos ({} de {} bytes).", len, n)),
         None => Err("Imagen demasiado grande para extraerla.".into()),
     }

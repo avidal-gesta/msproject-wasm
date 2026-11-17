@@ -106,6 +106,11 @@ pub fn spend(bytes: usize, cut: bool) {
     })
 }
 
+/// Si en la lectura en curso ya se corto algun dato por el limite de descompresion.
+pub fn decompressed_hit() -> bool {
+    STATE.with(|s| s.borrow().spent.decompressed_hit)
+}
+
 /// La parte de `s` que cabe en el limite de caracteres de la lectura en curso (todo `s` si no hay
 /// una abierta), y la descuenta. Los lectores la usan al juntar texto para no acumular de mas.
 pub fn take_text(s: &str) -> &str {

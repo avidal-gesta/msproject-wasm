@@ -39,13 +39,17 @@ fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// zlib con un solo bloque sin comprimir.
+/// zlib con bloques sin comprimir (uno solo si caben en 65.535 bytes).
 fn zlib_stored(d: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x78, 0x01, 1];
-    let n = d.len() as u16;
-    out.extend_from_slice(&n.to_le_bytes());
-    out.extend_from_slice(&(!n).to_le_bytes());
-    out.extend_from_slice(d);
+    let mut out = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = if d.is_empty() { vec![d] } else { d.chunks(65_535).collect() };
+    for (i, block) in blocks.iter().enumerate() {
+        out.push(u8::from(i + 1 == blocks.len()));
+        let n = block.len() as u16;
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&(!n).to_le_bytes());
+        out.extend_from_slice(block);
+    }
     let (mut a, mut b) = (1u32, 0u32);
     for &x in d {
         a = (a + x as u32) % 65521;
@@ -731,4 +735,21 @@ fn topes_de_imagenes_distintas_y_de_lugares() {
     let d = read(&bytes).unwrap();
     assert_eq!(d.images[0].places.len(), 100_000);
     assert!(d.warnings.iter().any(|w| w.contains("20000 lugares")), "{:?}", d.warnings);
+}
+
+#[test]
+fn imagen_cortada_por_el_limite_de_descompresion_lo_dice() {
+    // 3 MB de pixeles con un limite de 1 MB por documento: la imagen no se extrae, y la nota dice
+    // que fue el limite (no un archivo danado).
+    let bytes = pdf_con(
+        "/Im1 5 0 R",
+        "q 10 0 0 10 0 0 cm /Im1 Do Q",
+        vec![stream("/Subtype /Image /Width 3000 /Height 1000 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode", &zlib_stored(&vec![7u8; 3_000_000]))],
+    );
+    let d = doc2json::read_with_options(&bytes, doc2json::budget::Limits::from_units(1, 0, 0), Some(doc2json::image::MAX_EXTRACTED)).unwrap();
+    assert!(d.images[0].data.is_none());
+    let note = d.images[0].note.as_deref().unwrap_or("");
+    assert!(note.contains("limite de datos descomprimidos"), "{note}");
+    // Sin limite bajo, la misma imagen sale completa.
+    assert!(read_with_images(&bytes).unwrap().images[0].data.is_some());
 }
