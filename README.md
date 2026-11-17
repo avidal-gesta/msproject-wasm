@@ -88,7 +88,8 @@ Los dos formatos salen con **la misma forma**, así una sola tabla en la base de
 | `text` | Todo el texto plano. |
 | `pages` | Solo PDF: tamaño y texto de cada página. |
 | `outline` | Solo PDF: marcadores (tabla de contenidos) con su página. |
-| `headers`, `footers`, `footnotes`, `endnotes`, `comments` | Solo Word, cuando existen. |
+| `headers`, `footers`, `footnotes` | Encabezados, pies y notas al pie: de Word y de PDF etiquetados, cuando existen. |
+| `endnotes`, `comments` | Solo Word, cuando existen. |
 | `warnings` | Avisos: páginas escaneadas sin texto, índice reconstruido, fuentes ilegibles. |
 
 Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de cada bloque, los tramos con formato (negrita, cursiva, enlaces) y, en PDF, cada línea con su posición y tamaño de letra.
@@ -104,7 +105,18 @@ Con `--full` (o `{ full: true }` en la web) se agregan estilo y alineación de c
 
 ### PDF
 
-Un PDF no guarda párrafos ni tablas: guarda letras sueltas con coordenadas. La estructura se **deduce**:
+**PDF etiquetado.** Word, LibreOffice y la mayoría de los programas de oficina exportan el PDF con un árbol de estructura (Tagged PDF, ISO 32000-1 §14.8) que dice qué es cada cosa. Cuando existe, los bloques salen de ahí y no de la posición del texto:
+
+- **Tablas** con sus filas y celdas reales, aunque una celda ocupe varias líneas; las celdas combinadas (`RowSpan`/`ColSpan`) dejan su lugar marcado con `merged` en las filas de abajo, igual que en Word.
+- **Títulos** con su nivel (`H1`…`H6`, `Title`), **listas** con su viñeta o numeración (`Lbl`) y las anidadas un nivel más adentro, y **figuras** con su texto alternativo.
+- **Notas al pie**: la cita queda en el texto como `[1]` y la nota va en `footnotes`, como en Word.
+- Los **encabezados, pies y números de página** vienen marcados como artefactos: quedan fuera del contenido y van en `headers` y `footers`, como en Word, una vez cada texto aunque se repita en todas las páginas (siguen también en el texto de cada página).
+- El texto que no pertenece a ningún elemento (firmas, contenido sin etiquetar) se agrega por posición después de los bloques de su página, para no perder nada. Si el árbol cubre menos de la mitad del texto, se usa el método por posición para todo el documento.
+- `metadata.tagged` vale `true` cuando la estructura salió de las etiquetas.
+
+Con el `ejemplo/` de este repositorio, los bloques del PDF etiquetado son idénticos a los del `.docx` original (prueba `pdf_etiquetado_igual_al_docx`).
+
+Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura se **deduce**: un PDF no guarda párrafos ni tablas, sino letras sueltas con coordenadas.
 
 - Las letras se agrupan en palabras y líneas según su posición; el texto girado o en páginas rotadas se endereza.
 - **Títulos** por tamaño de letra respecto del cuerpo del documento (o negrita con numeración de sección).
@@ -346,8 +358,9 @@ node web/prueba.mjs
 **doc2json**
 
 - **No hace OCR.** Un PDF escaneado (solo imagen) no tiene texto que extraer; se informa en `warnings`.
-- En PDF la estructura es una deducción. Funciona bien en documentos de oficina, informes y certificados; puede equivocarse con diseños muy libres (afiches, planos, revistas a varias columnas con recuadros).
-- Las tablas de PDF se detectan por alineación del texto, no por sus líneas dibujadas. Una tabla con celdas de varias líneas puede salir partida en más filas.
+- En PDF sin etiquetas la estructura es una deducción. Funciona bien en documentos de oficina, informes y certificados; puede equivocarse con diseños muy libres (afiches, planos, revistas a varias columnas con recuadros).
+- En PDF sin etiquetas las tablas se detectan por alineación del texto, no por sus líneas dibujadas. Una tabla con celdas de varias líneas puede salir partida en más filas.
+- En PDF etiquetado vale lo que diga el etiquetado. Word no exporta las combinaciones verticales de celdas (`RowSpan`), así que esas celdas salen vacías en vez de `merged`. No se leen las etiquetas de formularios incrustados (`/Stm`) ni las anotaciones referidas desde el árbol (`OBJR`): su texto igual se recupera por posición.
 - No abre PDF con cifrado AES-256 ni los que piden contraseña para abrirse: da un mensaje claro.
 - Si un PDF usa fuentes sin tabla de caracteres, ese texto es ilegible para cualquier extractor (también al copiar y pegar desde un visor).
 - Las imágenes se cuentan y, en Word, se nombran; no se extraen.
@@ -404,8 +417,9 @@ doc2json/src/           doc2json
     crypt.rs            MD5, RC4, AES-128 y manejador de seguridad estándar
     encoding.rs         codificaciones y nombres de glifos
     font.rs             fuentes y tablas ToUnicode
-    content.rs          intérprete del contenido de página
+    content.rs          intérprete del contenido de página (incluido el contenido marcado)
     layout.rs           de letras con coordenadas a líneas, párrafos y tablas
+    structure.rs        PDF etiquetado: árbol de estructura a títulos, listas, tablas y notas
   doc.rs                modelo común de documento y salida JSON
   symbols.rs            fuentes Symbol y Wingdings a Unicode
 doc2json/tests/

@@ -31,6 +31,8 @@ export interface DocMetadata {
   producer?: string;
   pdf_version?: string;
   encrypted?: boolean;
+  /** Solo PDF: la estructura salio del etiquetado del documento (Tagged PDF), no de la posicion del texto. */
+  tagged?: boolean;
   [key: string]: string | number | boolean | undefined;
 }
 
@@ -123,10 +125,12 @@ export interface DocDocument {
   pages?: DocPage[];
   /** Solo PDF: marcadores (tabla de contenidos). */
   outline?: DocOutlineItem[];
-  /** Solo Word, cuando existen. */
+  /** Notas al pie (Word y PDF etiquetado), con su numero en `label`; el texto las cita como "[n]". */
+  footnotes?: DocBlock[];
+  /** Encabezados y pies (Word y PDF etiquetado). En PDF, una vez cada texto aunque se repita en varias paginas. */
   headers?: DocBlock[];
   footers?: DocBlock[];
-  footnotes?: DocBlock[];
+  /** Solo Word, cuando existen. */
   endnotes?: DocBlock[];
   comments?: DocBlock[];
   /** Avisos: paginas escaneadas sin texto, indice reconstruido, fuentes ilegibles. */

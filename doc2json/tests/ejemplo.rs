@@ -55,9 +55,33 @@ fn docx_de_ejemplo() {
     assert!(last.runs.first().map_or(false, |r| r.bold && r.text.starts_with("Importante")));
 }
 
+/// Resumen comparable de un bloque: tipo, nivel, marcador, texto y celdas.
+fn firma(b: &Block) -> String {
+    let rows: Vec<String> = b.rows.iter().map(|r| r.iter().map(|c| format!("{}/{}/{}/{}", c.text, c.colspan, c.rowspan, c.merged)).collect::<Vec<_>>().join("|")).collect();
+    format!("{:?} {} {:?} {:?} {} {}", b.kind, b.level, b.marker, b.label, b.text, rows.join("//"))
+}
+
+#[test]
+fn pdf_etiquetado_igual_al_docx() {
+    // El PDF de ejemplo lo exporto Word con etiquetas: leyendo el arbol de estructura, los bloques
+    // salen iguales a los del .docx original (titulo, niveles, listas, tabla y nota al pie).
+    let pdf = doc2json::read(&ejemplo("procedimiento.pdf")).unwrap();
+    let docx = doc2json::read(&ejemplo("procedimiento.docx")).unwrap();
+    assert!(pdf.meta.iter().any(|(k, v)| *k == "tagged" && matches!(v, doc2json::doc::Meta::Bool(true))));
+    let a: Vec<String> = pdf.content.iter().map(firma).collect();
+    let b: Vec<String> = docx.content.iter().map(firma).collect();
+    assert_eq!(a, b);
+    let notes = |d: &doc2json::Document| d.extras.iter().find(|(k, _)| *k == "footnotes").map(|(_, v)| v.iter().map(firma).collect::<Vec<_>>()).unwrap_or_default();
+    assert_eq!(notes(&pdf), notes(&docx));
+    assert!(pdf.content.iter().all(|b| b.page == Some(1)));
+    // El texto de la pagina no cambia: sigue siendo el de la pagina completa.
+    assert!(pdf.pages[0].text.contains("Supervisor\tAutoriza el bloqueo\tPermiso de trabajo"));
+}
+
 #[test]
 fn pdf_de_ejemplo() {
-    let doc = doc2json::read(&ejemplo("procedimiento.pdf")).unwrap();
+    // Sin usar las etiquetas: la estructura se deduce por posicion (camino de los PDF sin etiquetar).
+    let doc = doc2json::pdf::read_with(&ejemplo("procedimiento.pdf"), false).unwrap();
     assert_eq!(doc.kind, "pdf");
     assert_eq!(doc.page_count, Some(1));
     assert_eq!(doc.pages.len(), 1);

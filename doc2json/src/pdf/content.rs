@@ -38,6 +38,27 @@ pub struct Item {
     pub dx: f64,
     pub dy: f64,
     pub bold: bool,
+    /// PDF etiquetado: identificador del contenido marcado (MCID) al que pertenece el tramo.
+    pub mcid: Option<i64>,
+    /// PDF etiquetado: el tramo es un artefacto (encabezado, pie, numero de pagina), no contenido.
+    pub artifact: bool,
+    /// Tipo de artefacto: `ART_PAGINACION` (sin subtipo), `ART_ENCABEZADO`, `ART_PIE` u `ART_OTRO`.
+    pub art: u8,
+}
+
+/// Artefacto de paginacion sin subtipo declarado: se clasifica por su posicion en la pagina.
+pub const ART_PAGINACION: u8 = 0;
+pub const ART_ENCABEZADO: u8 = 1;
+pub const ART_PIE: u8 = 2;
+/// Diseno, fondo o pagina (lineas, marcas de agua): no es texto del documento.
+pub const ART_OTRO: u8 = 3;
+
+/// Contenido marcado abierto (`BMC`/`BDC` ... `EMC`).
+#[derive(Clone, Copy, Default)]
+struct Marked {
+    mcid: Option<i64>,
+    artifact: bool,
+    art: u8,
 }
 
 #[derive(Default)]
@@ -71,6 +92,8 @@ pub struct Interp<'p, 'a> {
     depth: usize,
     /// Presupuesto de operaciones, para cortar contenidos patologicos.
     budget: usize,
+    /// Pila de contenido marcado; cruza los formularios invocados con `Do`.
+    marked: Vec<Marked>,
 }
 
 fn num(o: Option<&Obj>) -> f64 {
@@ -79,7 +102,46 @@ fn num(o: Option<&Obj>) -> f64 {
 
 impl<'p, 'a> Interp<'p, 'a> {
     pub fn new(pdf: &'p Pdf<'a>, fonts: &'p FontCache) -> Interp<'p, 'a> {
-        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000 }
+        Interp { pdf, fonts, out: PageText::default(), cur: None, depth: 0, budget: 20_000_000, marked: Vec::new() }
+    }
+
+    /// Cierra el contenido marcado que haya quedado abierto (antes de las anotaciones, que van aparte).
+    pub fn end_marked(&mut self) {
+        self.flush();
+        self.marked.clear();
+    }
+
+    /// Contenido marcado vigente: el MCID mas interno y si alguno de los abiertos es artefacto.
+    fn marked_now(&self) -> Marked {
+        self.marked.last().copied().unwrap_or_default()
+    }
+
+    /// Abre contenido marcado. `props` es el diccionario de propiedades de `BDC` (en linea o por
+    /// nombre en /Properties); `BMC` no lo trae. Un MCID ausente hereda el del contenido que lo envuelve.
+    fn begin_marked(&mut self, tag: Option<&str>, props: Option<&Obj>, resources: &Dict) {
+        let parent = self.marked_now();
+        let props: Option<Dict> = match props {
+            Some(Obj::Dict(d)) => Some(d.clone()),
+            Some(Obj::Name(n)) => self.pdf.dict(resources, "Properties").and_then(|p| p.get(n).map(|o| self.pdf.resolve(o))).and_then(|o| o.as_dict().cloned()),
+            _ => None,
+        };
+        let mcid = props.as_ref().and_then(|p| p.get("MCID")).and_then(|v| v.as_i64()).or(parent.mcid);
+        let own = tag == Some("Artifact");
+        let artifact = parent.artifact || own;
+        let art = if own {
+            let field = |k: &str| props.as_ref().and_then(|p| p.get(k)).and_then(|v| v.as_name()).map(String::from);
+            match (field("Type").as_deref(), field("Subtype").as_deref()) {
+                (_, Some("Header")) => ART_ENCABEZADO,
+                (_, Some("Footer")) => ART_PIE,
+                (Some("Layout") | Some("Page") | Some("Background"), _) | (_, Some("Watermark")) => ART_OTRO,
+                _ => ART_PAGINACION,
+            }
+        } else {
+            parent.art
+        };
+        if self.marked.len() < 256 {
+            self.marked.push(Marked { mcid, artifact, art });
+        }
     }
 
     fn font(&self, resources: &Dict, name: &str) -> Option<Rc<Font>> {
@@ -152,12 +214,14 @@ impl<'p, 'a> Interp<'p, 'a> {
         tm[4] += total * tm[0];
         tm[5] += total * tm[1];
 
+        let mk = self.marked_now();
         for (text, sx, sy, ex, ey) in glyphs {
             if let Some(cur) = self.cur.as_mut() {
                 // Distancia del nuevo glifo al final del tramo, a lo largo y a traves de la linea.
                 let along = (sx - cur.x1) * cur.dx + (sy - cur.y1) * cur.dy;
                 let across = (-(sx - cur.x1) * cur.dy + (sy - cur.y1) * cur.dx).abs();
-                let same = across < 0.2 * size && (size - cur.size).abs() < 0.08 * size.max(cur.size) && cur.dx * dx + cur.dy * dy > 0.98 && cur.bold == font.bold;
+                // Un tramo no mezcla contenido marcado distinto: cada uno pertenece a otro elemento.
+                let same = across < 0.2 * size && (size - cur.size).abs() < 0.08 * size.max(cur.size) && cur.dx * dx + cur.dy * dy > 0.98 && cur.bold == font.bold && cur.mcid == mk.mcid && cur.artifact == mk.artifact && cur.art == mk.art;
                 if same && along > -0.3 * size && along < 1.2 * size {
                     // Un hueco mayor que un apretado entre letras es un espacio entre palabras.
                     if along > 0.15 * size && !cur.text.ends_with(' ') && !text.starts_with(' ') {
@@ -173,7 +237,7 @@ impl<'p, 'a> Interp<'p, 'a> {
             if text.trim().is_empty() {
                 continue; // un tramo no empieza con espacios
             }
-            self.cur = Some(Item { text, x0: sx, y0: sy, x1: ex, y1: ey, size, dx, dy, bold: font.bold });
+            self.cur = Some(Item { text, x0: sx, y0: sy, x1: ex, y1: ey, size, dx, dy, bold: font.bold, mcid: mk.mcid, artifact: mk.artifact, art: mk.art });
         }
     }
 
@@ -290,6 +354,11 @@ impl<'p, 'a> Interp<'p, 'a> {
                     if let Some(name) = args.first().and_then(|a| a.as_name()) {
                         self.xobject(resources, name, st);
                     }
+                }
+                "BMC" => self.begin_marked(args.first().and_then(|a| a.as_name()), None, resources),
+                "BDC" => self.begin_marked(args.first().and_then(|a| a.as_name()), args.get(1), resources),
+                "EMC" => {
+                    self.marked.pop();
                 }
                 "BI" => {
                     // Imagen incrustada: se salta el diccionario y los datos binarios.
