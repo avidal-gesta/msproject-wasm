@@ -204,3 +204,30 @@ fn los_cortes_no_dejan_marcas_sin_escapar() {
         }
     }
 }
+
+/// Palabras de un texto sin las marcas de Markdown (barras, barras invertidas, guiones de tabla).
+fn palabras(s: &str) -> Vec<String> {
+    let mut v: Vec<String> = s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn una_tabla_muy_ancha_respeta_el_tamano_de_los_fragmentos() {
+    // 64 columnas con texto en todas (como una planilla ancha): ni una fila sola cabe con el
+    // encabezado en 2.000 caracteres. Antes salian fragmentos de mas; ahora ninguno pasa el tope
+    // y no se pierde ninguna palabra, tampoco con fragmentos chicos.
+    let fila = |p: &str| format!("<w:tr>{}</w:tr>", (0..64).map(|i| celda(&format!("{}{} con algo de texto en la celda", p, i), "")).collect::<String>());
+    let filas: String = std::iter::once(fila("titulo")).chain((0..3).map(|r| fila(&format!("dato{}x", r)))).collect();
+    let d = doc2json::read(&docx(&format!("<w:tbl>{}</w:tbl>", filas), "")).unwrap();
+    let todo = palabras(&doc2json::markdown::to_markdown(&d));
+    // 200 es el minimo de un fragmento (MIN_CHUNK).
+    for max in [2000, 500, 200] {
+        let c = doc2json::markdown::chunks(&d, max);
+        assert!(c.iter().all(|x| x.text.chars().count() <= max), "max {}: {:?}", max, c.iter().map(|x| x.text.chars().count()).max());
+        let juntas = palabras(&c.iter().map(|x| x.text.as_str()).collect::<Vec<_>>().join("\n"));
+        for w in &todo {
+            assert!(juntas.binary_search(w).is_ok(), "max {}: falta {}", max, w);
+        }
+    }
+}

@@ -667,7 +667,10 @@ pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
             let head_cells = if real_head { cells[0].clone() } else { vec![String::new(); width] };
             let head = format!("{}\n{}", row_line(&head_cells), separator(width));
             let head_len = head.chars().count() + 1;
-            let body = if real_head { &cells[1..] } else { &cells[..] };
+            // Un encabezado que ocupa mas de la mitad del fragmento (tablas muy anchas o fragmentos
+            // chicos) no se repite: la tabla sale como texto, fila por fila, sin perder el encabezado.
+            let plain = head_len * 2 > b.max;
+            let body = if real_head && !plain { &cells[1..] } else { &cells[..] };
             // Filas que caben en un fragmento junto al encabezado (las mas largas, repartidas).
             let lines: Vec<String> = body.iter().flat_map(|r| split_row(r, b.max.saturating_sub(head_len))).collect();
             let mut part = head.clone();
@@ -675,6 +678,22 @@ pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
             let mut limit = room(&b);
             for row in &lines {
                 let row_len = row.chars().count();
+                if plain || head_len + row_len > b.max {
+                    // Ni sola con el encabezado cabe (muchas columnas con texto): esa fila sale como
+                    // texto partido al tamano del fragmento, despues de las filas anteriores.
+                    if part_len != head_len - 1 {
+                        b.push(&part, Kind::Table, blk.page, &here);
+                    }
+                    b.emit();
+                    for piece in split_text(row, b.max - 1) {
+                        b.push(&escape_start(&piece), Kind::Paragraph, blk.page, &here);
+                        b.emit();
+                    }
+                    part = head.clone();
+                    part_len = head_len - 1;
+                    limit = b.max;
+                    continue;
+                }
                 let fits = part_len + row_len < limit;
                 if !fits && part_len == head_len - 1 && limit < b.max {
                     // Ni la primera fila cabe junto a los titulos: los titulos van solos.
@@ -692,7 +711,9 @@ pub fn chunks(d: &Document, max_chars: usize) -> Vec<Chunk> {
                 part.push_str(row);
                 part_len += row_len + 1;
             }
-            b.push(&part, Kind::Table, blk.page, &here);
+            if part_len != head_len - 1 {
+                b.push(&part, Kind::Table, blk.page, &here);
+            }
             b.emit();
         } else {
             // Cada parte se escapa al inicio como una linea nueva (un corte puede dejar "# ..." o
