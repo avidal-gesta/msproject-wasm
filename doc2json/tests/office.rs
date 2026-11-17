@@ -5,14 +5,28 @@
 use doc2json::doc::{Block, Document, Kind};
 use doc2json::{detect, read, Format};
 
-/// ZIP sin compresion (metodo 0) con varias partes.
+/// ZIP sin compresion (metodo 0) con varias partes de texto.
 fn zip(partes: &[(&str, &str)]) -> Vec<u8> {
+    zip_bytes(&partes.iter().map(|(n, c)| (*n, c.as_bytes())).collect::<Vec<_>>())
+}
+
+/// Cabecera de un PNG de `w` x `h` pixeles (basta para reconocer formato y tamano).
+fn png(w: u32, h: u32) -> Vec<u8> {
+    let mut p = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    p.extend_from_slice(&w.to_be_bytes());
+    p.extend_from_slice(&h.to_be_bytes());
+    p.extend_from_slice(&[8, 2, 0, 0, 0]);
+    p
+}
+
+/// ZIP sin compresion (metodo 0) con varias partes.
+fn zip_bytes(partes: &[(&str, &[u8])]) -> Vec<u8> {
     let le16 = |v: usize| (v as u16).to_le_bytes();
     let le32 = |v: usize| (v as u32).to_le_bytes();
     let mut z = Vec::new();
     let mut central = Vec::new();
     for (nombre, contenido) in partes {
-        let (n, c) = (nombre.as_bytes(), contenido.as_bytes());
+        let (n, c) = (nombre.as_bytes(), *contenido);
         let desde = z.len();
         z.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         z.extend_from_slice(&le32(c.len()));
@@ -69,7 +83,7 @@ fn presentacion() -> Vec<u8> {
         <a:tr><a:tc gridSpan="2"><a:txBody><a:p><a:r><a:t>Equipo</a:t></a:r></a:p></a:txBody></a:tc><a:tc hMerge="1"><a:txBody><a:p/></a:txBody></a:tc><a:tc rowSpan="2"><a:txBody><a:p><a:r><a:t>Riesgo</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
         <a:tr><a:tc><a:txBody><a:p><a:r><a:t>Grua</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>50 t</a:t></a:r></a:p></a:txBody></a:tc><a:tc vMerge="1"><a:txBody><a:p/></a:txBody></a:tc></a:tr>
         </a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#;
-    let imagen = r#"<p:pic><p:nvPicPr><p:cNvPr id="6" name="Imagen" descr="Diagrama del circuito"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId2"/></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="5000000"/></a:xfrm></p:spPr></p:pic>"#;
+    let imagen = r#"<p:pic><p:nvPicPr><p:cNvPr id="6" name="Imagen" descr="Diagrama del circuito"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId2"/></p:blipFill><p:spPr><a:xfrm><a:off x="1270000" y="5000000"/><a:ext cx="2540000" cy="1270000"/></a:xfrm></p:spPr></p:pic>"#;
     let grupo = format!(
         r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="7" name="g"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="4000000"/></a:xfrm></p:grpSpPr>{}{}</p:grpSp>"#,
         forma("", 5000000, 4000000, "<a:p><a:r><a:t>Grupo derecha</a:t></a:r></a:p>"),
@@ -112,17 +126,23 @@ fn presentacion() -> Vec<u8> {
         r#"<?xml version="1.0"?><p:presentation {}><p:sldIdLst><p:sldId id="256" r:id="rId3"/><p:sldId id="257" r:id="rId1"/><p:sldId id="258" r:id="rId2"/></p:sldIdLst></p:presentation>"#,
         NS
     );
-    zip(&[
-        ("_rels/.rels", &rels(&[("rId1", "officeDocument", "ppt/presentation.xml"), ("rId2", "metadata/core-properties", "docProps/core.xml")])),
-        ("docProps/core.xml", r#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>Charla de izaje</dc:title></cp:coreProperties>"#),
-        ("ppt/presentation.xml", &presentacion),
-        ("ppt/_rels/presentation.xml.rels", &rels(&[("rId1", "slide", "slides/slide1.xml"), ("rId2", "slide", "slides/slide3.xml"), ("rId3", "slide", "slides/slide2.xml")])),
-        ("ppt/slides/slide1.xml", &s1),
-        ("ppt/slides/_rels/slide1.xml.rels", &rels(&[("rId2", "image", "../media/image1.png"), ("rId3", "notesSlide", "../notesSlides/notesSlide1.xml"), ("rId4", "hyperlink", "https://example.com/izaje")])),
-        ("ppt/slides/slide2.xml", &s2),
-        ("ppt/slides/slide3.xml", &s3),
-        ("ppt/notesSlides/notesSlide1.xml", &notas),
-    ])
+    let partes = [
+        ("_rels/.rels", rels(&[("rId1", "officeDocument", "ppt/presentation.xml"), ("rId2", "metadata/core-properties", "docProps/core.xml")])),
+        ("docProps/core.xml", r#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="x" xmlns:dc="y"><dc:title>Charla de izaje</dc:title></cp:coreProperties>"#.to_string()),
+        ("ppt/presentation.xml", presentacion),
+        ("ppt/_rels/presentation.xml.rels", rels(&[("rId1", "slide", "slides/slide1.xml"), ("rId2", "slide", "slides/slide3.xml"), ("rId3", "slide", "slides/slide2.xml")])),
+        ("ppt/slides/slide1.xml", s1),
+        ("ppt/slides/_rels/slide1.xml.rels", rels(&[("rId2", "image", "../media/image1.png"), ("rId3", "notesSlide", "../notesSlides/notesSlide1.xml"), ("rId4", "hyperlink", "https://example.com/izaje")])),
+        ("ppt/slides/slide2.xml", s2),
+        // La diapositiva oculta usa la misma imagen: no suma un lugar.
+        ("ppt/slides/slide3.xml", s3.replace("</p:spTree>", &format!("{}</p:spTree>", imagen))),
+        ("ppt/slides/_rels/slide3.xml.rels", rels(&[("rId2", "image", "../media/image1.png")])),
+        ("ppt/notesSlides/notesSlide1.xml", notas),
+    ];
+    let media = png(640, 320);
+    let mut lista: Vec<(&str, &[u8])> = partes.iter().map(|(n, c)| (*n, c.as_bytes())).collect();
+    lista.push(("ppt/media/image1.png", &media));
+    zip_bytes(&lista)
 }
 
 fn textos(d: &Document) -> Vec<String> {
@@ -190,6 +210,51 @@ fn powerpoint_tablas_grupos_imagenes_y_notas() {
     assert_eq!(notas.len(), 1);
     assert_eq!((notas[0].text.as_str(), notas[0].label.as_deref()), ("Recordar la charla de 5 minutos.", Some("2")));
     assert!(d.meta.iter().any(|(k, _)| *k == "title"));
+}
+
+#[test]
+fn powerpoint_imagenes_en_la_lista_comun() {
+    let d = doc2json::read_with_images(&presentacion()).unwrap();
+    assert_eq!(d.images.len(), 1, "la oculta no suma");
+    let img = &d.images[0];
+    assert_eq!((img.id, img.format, img.width, img.height, img.alt.as_str()), (1, "png", Some(640), Some(320), "Diagrama del circuito"));
+    assert_eq!(img.places.len(), 1);
+    let p = &img.places[0];
+    // 12.700 EMU por punto: (1270000, 5000000) y 2540000 x 1270000 EMU.
+    assert_eq!((p.page, p.x, p.y, p.w, p.h), (Some(2), Some(100.0), Some(393.7), 200.0, 100.0));
+    assert_eq!(img.data.as_deref(), Some(&png(640, 320)[..]));
+    let bloque = d.content.iter().find(|b| b.kind == Kind::Image).unwrap();
+    assert_eq!(bloque.image, Some(1));
+    // Sin pedir las imagenes, la lista esta igual pero sin bytes.
+    let sin = read(&presentacion()).unwrap();
+    assert_eq!((sin.images.len(), sin.images[0].data.is_none()), (1, true));
+}
+
+#[test]
+fn excel_imagenes_de_los_dibujos() {
+    let x = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+    let dibujo = r#"<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:row>2</xdr:row></xdr:from><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo" descr="Logo de la faena"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
+    let partes = [
+        ("_rels/.rels", rels(&[("rId1", "officeDocument", "xl/workbook.xml")])),
+        ("xl/workbook.xml", format!(r#"<?xml version="1.0"?><workbook {}><sheets><sheet name="Datos" sheetId="1" r:id="rId1"/><sheet name="Portada" sheetId="2" r:id="rId2"/></sheets></workbook>"#, x)),
+        ("xl/_rels/workbook.xml.rels", rels(&[("rId1", "worksheet", "worksheets/sheet1.xml"), ("rId2", "worksheet", "worksheets/sheet2.xml")])),
+        ("xl/worksheets/sheet1.xml", format!(r#"<?xml version="1.0"?><worksheet {}><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Equipo</t></is></c></row></sheetData></worksheet>"#, x)),
+        // Una hoja sin celdas, solo con la imagen: igual sale con su titulo.
+        ("xl/worksheets/sheet2.xml", format!(r#"<?xml version="1.0"?><worksheet {}><sheetData/><drawing r:id="rId1"/></worksheet>"#, x)),
+        ("xl/worksheets/_rels/sheet2.xml.rels", rels(&[("rId1", "drawing", "../drawings/drawing1.xml")])),
+        ("xl/drawings/drawing1.xml", dibujo.to_string()),
+        ("xl/drawings/_rels/drawing1.xml.rels", rels(&[("rId1", "image", "../media/image1.png")])),
+    ];
+    let media = png(200, 80);
+    let mut lista: Vec<(&str, &[u8])> = partes.iter().map(|(n, c)| (*n, c.as_bytes())).collect();
+    lista.push(("xl/media/image1.png", &media));
+    let d = doc2json::read_with_images(&zip_bytes(&lista)).unwrap();
+    assert_eq!(textos(&d), vec!["Datos", "", "Portada", "Logo de la faena"]);
+    assert_eq!(d.content[1].rows[0][0].text, "Equipo");
+    let img = &d.images[0];
+    assert_eq!((img.format, img.width, img.alt.as_str(), img.places[0].page), ("png", Some(200), "Logo de la faena", Some(2)));
+    assert_eq!(img.data.as_deref(), Some(&media[..]));
+    assert_eq!(d.content.last().unwrap().image, Some(1));
 }
 
 #[test]

@@ -12,7 +12,8 @@
 //! Los nombres de las etiquetas se comparan sin prefijo: algunos programas escriben `<x:row>`.
 
 use crate::doc::*;
-use crate::docx::{part_rels, properties, relationships, resolve};
+use crate::docx::{extract_images, part_rels, properties, relationships, resolve};
+use crate::image::{format_from_name, ImageSet};
 use crate::xml::{Ev, Xml};
 use crate::zipread::ZipArchive;
 use std::collections::HashMap;
@@ -481,7 +482,54 @@ fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str) 
     Some(Block { kind: Kind::Table, rows: out, page: Some(page), ..Block::default() })
 }
 
+/// Imagenes de los dibujos de una hoja (`xl/drawings/...`), como bloques `image` citados en la
+/// lista comun. Excel las ancla a celdas, no a puntos: su lugar solo dice la hoja.
+fn sheet_images(zip: &ZipArchive, sheet_path: &str, number: u32, set: &mut ImageSet) -> Vec<Block> {
+    let (dir, file) = sheet_path.rsplit_once('/').unwrap_or(("", sheet_path));
+    let rels_path = format!("{}/_rels/{}.rels", dir, file);
+    let mut out = Vec::new();
+    for (_, kind, target, external) in relationships(zip, &rels_path) {
+        if kind != "drawing" || external {
+            continue;
+        }
+        let drawing = resolve(dir, &target);
+        let Some(src) = zip.read_text(&drawing) else { continue };
+        let rels = part_rels(zip, &drawing);
+        let mut x = Xml::new(&src);
+        let (mut alt, mut pic): (String, Option<String>) = (String::new(), None);
+        while let Some(ev) = x.next() {
+            match ev {
+                Ev::Start(t) => match local(t.name) {
+                    "pic" => {
+                        alt.clear();
+                        pic = None;
+                    }
+                    "cNvPr" => alt = t.attr("descr").or_else(|| t.attr("title")).unwrap_or_default(),
+                    "blip" => pic = t.attr("r:embed").or_else(|| t.attr("r:link")).and_then(|id| rels.get(&id).cloned()),
+                    _ => {}
+                },
+                Ev::End(n) if local(n) == "pic" => {
+                    if let Some(path) = pic.take() {
+                        let name = path.rsplit('/').next().map(str::to_string);
+                        let text = alt.trim().to_string();
+                        let place = Place { page: Some(number), ..Place::default() };
+                        let id = set.add(&path, Some(place), &text, || Image { format: format_from_name(&path), name: name.clone(), ..Image::default() });
+                        out.push(Block { kind: Kind::Image, name, text, page: Some(number), image: Some(id), ..Block::default() });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 pub fn read(data: &[u8]) -> Result<Document, String> {
+    read_opts(data, false)
+}
+
+/// Lee el libro; con `images` agrega los bytes de cada imagen de `Document::images`.
+pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
     let zip = ZipArchive::open(data).map_err(|_| "El archivo .xlsx esta danado o incompleto: no se pudo abrir como ZIP.".to_string())?;
     let main = relationships(&zip, "_rels/.rels")
         .into_iter()
@@ -526,29 +574,39 @@ pub fn read(data: &[u8]) -> Result<Document, String> {
     properties(&zip, &mut doc);
     let mut hidden = 0usize;
     let mut number = 0u32;
+    let mut set = ImageSet::default();
     for (name, path, is_hidden) in &sheets {
         if *is_hidden {
             hidden += 1;
             continue;
         }
         number += 1;
-        // Las hojas de graficos o de macros no tienen celdas.
-        let Some(src) = path.as_ref().and_then(|p| zip.read_text(p)) else { continue };
-        if !src.contains("sheetData") {
-            continue;
-        }
-        let sheet = read_sheet(&src, &ctx);
-        if sheet.truncated {
-            doc.warnings.push(format!("Hoja «{}»: se leyeron solo las primeras {} celdas con datos.", name, MAX_CELLS));
-        }
-        if let Some(table) = sheet_table(sheet, number, &mut doc.warnings, name) {
+        let Some(path) = path else { continue };
+        let Some(src) = zip.read_text(path) else { continue };
+        // Las hojas de graficos o de macros no tienen celdas, pero pueden tener imagenes.
+        let table = if src.contains("sheetData") {
+            let sheet = read_sheet(&src, &ctx);
+            if sheet.truncated {
+                doc.warnings.push(format!("Hoja «{}»: se leyeron solo las primeras {} celdas con datos.", name, MAX_CELLS));
+            }
+            sheet_table(sheet, number, &mut doc.warnings, name)
+        } else {
+            None
+        };
+        let pics = sheet_images(&zip, path, number, &mut set);
+        if table.is_some() || !pics.is_empty() {
             doc.content.push(Block { kind: Kind::Heading, level: 1, text: name.clone(), page: Some(number), ..Block::default() });
-            doc.content.push(table);
+            doc.content.extend(table);
+            doc.content.extend(pics);
         }
     }
     doc.page_count = Some(number as usize);
     if hidden > 0 {
         doc.warnings.push(format!("Se omitieron {} hojas ocultas.", hidden));
+    }
+    doc.images = set.list;
+    if images {
+        extract_images(&zip, &mut doc.images, &set.keys);
     }
     Ok(doc)
 }

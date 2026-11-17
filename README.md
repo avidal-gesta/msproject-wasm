@@ -5,7 +5,7 @@ Dos herramientas independientes, escritas en **Rust sin ninguna dependencia**, q
 | Herramienta | Entrada | Salida | Ejecutable | WebAssembly |
 |---|---|---|---|---|
 | **mpp2xlsx** | Microsoft Project (`.mpp`) | Excel (`.xlsx`) con Gantt, y JSON | 569 KB | 339 KB (93 KB con brotli) |
-| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado, e imágenes | 531 KB | 456 KB (142 KB con brotli) |
+| **doc2json** | Word (`.docx`), PDF, PowerPoint (`.pptx`) y Excel (`.xlsx`) | JSON con el contenido estructurado, Markdown y fragmentos, e imágenes | 738 KB | 651 KB (203 KB con brotli) |
 
 No necesitan Microsoft Project, Office, Java ni conexión a internet. Todo el código que lee los formatos es propio: contenedor OLE2, formato MPP, ZIP, DEFLATE, XML, PDF y sus cifrados.
 
@@ -186,12 +186,14 @@ Sin etiquetas (escáneres, generadores de informes, PDF antiguos), la estructura
 
 - **Word:** cada imagen sigue en `content` como bloque `image` en su lugar de lectura, ahora con `"image": <id>`; las que están dentro de una tabla (pictogramas, firmas) quedan citadas desde su celda, en `images`. `places` trae el tamaño con que se muestra (`w`, `h`, en puntos). Las de encabezados y pies figuran en la lista aunque esos bloques salgan como texto.
 - **PDF:** `places` dice en qué página y dónde se dibuja cada vez: `x`, `y` (esquina superior izquierda, medida desde la esquina superior izquierda de la página en su orientación de lectura, igual que `y` de las líneas), `w` y `h`, en puntos. `width` y `height` son los píxeles de la imagen.
+- **PowerPoint:** bloque `image` con su `id` en la diapositiva, y `places` con la diapositiva (`page`) y su rectángulo en puntos. Dentro de un grupo, el rectángulo va en las coordenadas del grupo (casi siempre las de la diapositiva). Las de diapositivas ocultas no se listan.
+- **Excel:** las imágenes de los dibujos de cada hoja, como bloques `image` después de su tabla; `places` solo dice la hoja (`page`), porque Excel las ancla a celdas y no a puntos.
 
 **Extraer los archivos:** `--imagenes[=carpeta]` en la consola (quedan como `imagen-<id>.<formato>`), `docToJson(archivo, { images: true })` en la web (cada imagen trae sus bytes en `data`, un `Uint8Array`, con `mime` y `size`; `minSide: 32` omite los bytes de iconos y líneas) y `doc2json::read_with_images` en Rust.
 
 | Origen | Se entrega como |
 |---|---|
-| Word | El archivo incrustado tal cual (PNG, JPEG, GIF, EMF, WMF, SVG…). |
+| Word, PowerPoint y Excel | El archivo incrustado tal cual (PNG, JPEG, GIF, EMF, WMF, SVG…). |
 | PDF con JPEG (DCTDecode) o JPEG 2000 (JPXDecode) | El mismo JPEG o JPEG 2000, sin recomprimir. |
 | PDF con fax (CCITTFaxDecode, grupos 3 y 4) o JBIG2 | PNG de un bit, decodificado: escaneos en blanco y negro listos para OCR o para un modelo de visión. Un fax que no se puede decodificar se entrega tal cual, en un TIFF. |
 | PDF con píxeles (Flate, LZW, RunLength o sin comprimir) | PNG: gris, RGB, CMYK (convertido a RGB), indexado con su paleta, tinta plana y máscaras de un bit, con transparencia si traen máscara suave del mismo tamaño (también la premezclada con `/Matte`). Si los datos ya son un PNG por dentro (Flate con predictor PNG), se copian sin recomprimir. |
@@ -458,7 +460,7 @@ node web/prueba.mjs
 - Si un PDF usa fuentes sin tabla de caracteres, ese texto es ilegible para cualquier extractor (también al copiar y pegar desde un visor).
 - En PDF las imágenes no se insertan en `content` (que se deduce del texto): se ubican con `places`.
 - Los PNG se comprimen con códigos Huffman fijos: una imagen sin compresión en el PDF puede quedar más pesada que con un compresor completo. Las fotografías suelen venir como JPEG, que se entrega tal cual.
-- En Word y PowerPoint no se lee el texto de gráficos ni de diagramas SmartArt; en Excel no se leen gráficos, imágenes ni comentarios.
+- En Word y PowerPoint no se lee el texto de gráficos ni de diagramas SmartArt; en Excel no se leen gráficos ni comentarios.
 - En Excel no se recalculan fórmulas ni se aplican los formatos de número completos (separador de miles, decimales fijos, moneda): los números salen con su valor exacto.
 - No lee `.doc`, `.xls` ni `.ppt` antiguos (Office 97-2003), ni libros binarios `.xlsb`, ni archivos de Office con contraseña de apertura: da un mensaje pidiendo guardarlos en el formato actual.
 
@@ -488,6 +490,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 
 - 162 presentaciones reales: coincide el 99,8 % de los caracteres y no hay texto duplicado. El resto también está, cortado distinto: los saltos de línea dentro de una celda de tabla se conservan como tales.
 - 1.003 planillas reales (2,2 millones de celdas con valor): coincide el 99,8 % de las celdas. Lo que no coincide son textos con escapes `_xHHHH_` que la referencia deja sin decodificar (Excel los muestra decodificados, como aquí), valores tapados por una combinación de celdas que Excel no muestra, y 112 números.
+- Imágenes, contra las que entregan python-pptx y openpyxl: en las 162 presentaciones y los 1.003 libros no falta ninguna y los bytes son idénticos. Aquí aparecen además 92 imágenes de PowerPoint que python-pptx no expone (formas rellenas con una imagen y figuras dentro de `mc:AlternateContent`) y 387 de Excel que openpyxl no carga (por ejemplo, las ancladas a una sola celda, como el logo de muchas exportaciones).
 
 **doc2json, imágenes** contra PyMuPDF y Pillow
 

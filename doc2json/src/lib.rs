@@ -117,8 +117,8 @@ pub fn read_with_options(bytes: &[u8], limits: budget::Limits, images: bool) -> 
     let result = match format {
         Format::Docx => docx::read_opts(bytes, images),
         Format::Pdf => pdf::read_opts(bytes, true, images),
-        Format::Pptx => pptx::read(bytes),
-        Format::Xlsx => xlsx::read(bytes),
+        Format::Pptx => pptx::read_opts(bytes, images),
+        Format::Xlsx => xlsx::read_opts(bytes, images),
     };
     let (_, decompressed_hit) = budget::end();
     let mut d = result?;

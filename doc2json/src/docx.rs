@@ -907,17 +907,23 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
     let set = std::mem::take(&mut r.images);
     doc.images = set.list;
     if images {
-        for (img, path) in doc.images.iter_mut().zip(&set.keys) {
-            match zip.read(path) {
-                Some(bytes) => {
-                    describe(img, &bytes);
-                    img.data = Some(bytes);
-                }
-                None => img.note = Some(if path.contains("://") { "Imagen vinculada desde fuera del documento.".into() } else { "No se pudo leer el archivo de la imagen.".into() }),
-            }
-        }
+        extract_images(&zip, &mut doc.images, &set.keys);
     }
     Ok(doc)
+}
+
+/// Bytes de las imagenes de un paquete Office: cada clave es la ruta de la parte en el ZIP (o
+/// la direccion de una imagen vinculada, que no se descarga).
+pub(crate) fn extract_images(zip: &ZipArchive, images: &mut [Image], keys: &[String]) {
+    for (img, path) in images.iter_mut().zip(keys) {
+        match zip.read(path) {
+            Some(bytes) => {
+                describe(img, &bytes);
+                img.data = Some(bytes);
+            }
+            None => img.note = Some(if path.contains("://") { "Imagen vinculada desde fuera del documento.".into() } else { "No se pudo leer el archivo de la imagen.".into() }),
+        }
+    }
 }
 
 #[cfg(test)]
