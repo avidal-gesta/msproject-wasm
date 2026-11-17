@@ -13,7 +13,7 @@ export interface Limits {
   maxDecompressedMB?: number;
   /** Paginas de PDF que se leen. Por defecto 20000. */
   maxPages?: number;
-  /** Caracteres de texto. Por defecto 50 000 000. */
+  /** Caracteres de texto: cuerpo primero, despues encabezados, pies, notas y comentarios. Por defecto 50 000 000. */
   maxChars?: number;
 }
 

@@ -62,6 +62,17 @@ comprobar('docToChunks rechaza un tamano fuera de rango', /maxChars/.test(await 
   const frag = await doc.docToChunks(bytes, { maxChars: 300, limits: { maxChars: 100 } });
   comprobar('limits tambien acota los fragmentos', largo(frag) < largo(await doc.docToChunks(bytes, { maxChars: 300 })));
   comprobar('limits rechaza valores invalidos', /maxPages/.test(await mensajeDeError(doc.docToJson(bytes, { limits: { maxPages: 0 } }))));
+  // Un .wasm anterior (doc_convert con tres parametros) no puede ignorar los limites en silencio.
+  // Modulo minimo armado a mano: solo exporta doc_convert(i32, i32, i32) -> i32.
+  const anterior = await import('./doc2json.js?wasm-anterior');
+  await anterior.init(new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x08, 0x01, 0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+    0x03, 0x02, 0x01, 0x00,
+    0x07, 0x0f, 0x01, 0x0b, ...new TextEncoder().encode('doc_convert'), 0x00, 0x00,
+    0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x00, 0x0b,
+  ]));
+  comprobar('limits con un .wasm anterior da error', /no admite limites/.test(await mensajeDeError(anterior.docToJson(bytes, { limits: { maxChars: 100 } }))));
 }
 
 // PDF minimo con una imagen RGB de 2 x 2 (sin comprimir) dibujada en la pagina.

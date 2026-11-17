@@ -97,10 +97,28 @@ const DIST_BASE: [u16; 30] = [
 const DIST_EXTRA: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 const CLEN_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
-fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, cap: usize) -> Option<()> {
+/// Agrega a `out` lo que quepa de `n` bytes hasta `cap`. Si no cabe todo, marca `cut` y devuelve
+/// `None` para cortar la descompresion; `fill(n)` agrega los bytes que si caben.
+fn fit(out: &mut Vec<u8>, n: usize, cap: usize, cut: &mut bool, fill: impl FnOnce(&mut Vec<u8>, usize)) -> Option<()> {
+    let room = cap.saturating_sub(out.len());
+    fill(out, n.min(room));
+    if n > room {
+        *cut = true;
+        return None;
+    }
+    Some(())
+}
+
+/// Descomprime un bloque con Huffman. `cut` se marca si la salida llego a `cap` (no por datos
+/// danados): lo que cabia queda en `out`, hasta exactamente `cap` bytes.
+fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, cap: usize, cut: &mut bool) -> Option<()> {
     loop {
         let sym = lit.decode(b)? as usize;
         if sym < 256 {
+            if out.len() >= cap {
+                *cut = true;
+                return None;
+            }
             out.push(sym as u8);
         } else if sym == 256 {
             return Some(());
@@ -115,22 +133,21 @@ fn block(b: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, cap: us
                 return None;
             }
             let distance = DIST_BASE[d] as usize + b.bits(DIST_EXTRA[d] as u32)? as usize;
-            if distance > out.len() || out.len() + len > cap {
+            if distance > out.len() {
                 return None;
             }
             let start = out.len() - distance;
-            for k in 0..len {
-                let v = out[start + k];
-                out.push(v);
-            }
-        }
-        if out.len() > cap {
-            return None;
+            fit(out, len, cap, cut, |o, k| {
+                for i in 0..k {
+                    let v = o[start + i];
+                    o.push(v);
+                }
+            })?;
         }
     }
 }
 
-fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize) -> Option<()> {
+fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize, cut: &mut bool) -> Option<()> {
     loop {
         let last = b.bits(1)?;
         match b.bits(2)? {
@@ -139,17 +156,15 @@ fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize) -> Option<()> {
                 let len = *b.d.get(b.pos)? as usize | (*b.d.get(b.pos + 1)? as usize) << 8;
                 b.pos += 4;
                 let chunk = b.d.get(b.pos..b.pos + len)?;
-                if out.len() + len > cap {
-                    return None;
-                }
-                out.extend_from_slice(chunk);
+                // Un bloque almacenado que no cabe entero tambien entrega lo que cabe y avisa.
+                fit(out, len, cap, cut, |o, k| o.extend_from_slice(&chunk[..k]))?;
                 b.pos += len;
             }
             1 => {
                 let mut l = [8u8; 288];
                 l[144..256].fill(9);
                 l[256..280].fill(7);
-                block(b, out, &Huffman::new(&l), &Huffman::new(&[5u8; 30]), cap)?;
+                block(b, out, &Huffman::new(&l), &Huffman::new(&[5u8; 30]), cap, cut)?;
             }
             2 => {
                 let nlit = b.bits(5)? as usize + 257;
@@ -184,7 +199,7 @@ fn run(b: &mut Bits, out: &mut Vec<u8>, cap: usize) -> Option<()> {
                     lengths[i..i + repeat].fill(value);
                     i += repeat;
                 }
-                block(b, out, &Huffman::new(&lengths[..nlit]), &Huffman::new(&lengths[nlit..]), cap)?;
+                block(b, out, &Huffman::new(&lengths[..nlit]), &Huffman::new(&lengths[nlit..]), cap, cut)?;
             }
             _ => return None,
         }
@@ -200,9 +215,10 @@ pub fn inflate(d: &[u8]) -> Inflated {
     let cap = crate::budget::room(MAX_OUTPUT);
     let mut out = Vec::with_capacity(d.len().saturating_mul(3).min(cap));
     let mut b = Bits { d, pos: 0, acc: 0, n: 0 };
-    let ok = run(&mut b, &mut out, cap).is_some();
-    // Se corto por el presupuesto (no por un tope fijo ni por datos danados): se avisa.
-    crate::budget::spend(out.len(), !ok && cap < MAX_OUTPUT && out.len() + 258 >= cap);
+    let mut cut = false;
+    let ok = run(&mut b, &mut out, cap, &mut cut).is_some();
+    // Se corto por el presupuesto (no por el tope fijo por flujo ni por datos danados): se avisa.
+    crate::budget::spend(out.len(), cut && cap < MAX_OUTPUT);
     Inflated { data: out, ok }
 }
 

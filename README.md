@@ -279,7 +279,7 @@ Si la web define una política de seguridad de contenido (CSP) estricta, `script
 
 ### Límites de recursos
 
-Cada lectura tiene un presupuesto: cuánto se puede descomprimir en total (todas las partes del `.docx` o todos los flujos del PDF), cuántas páginas de PDF se leen y cuánto texto se junta. Protege contra archivos hechos para agotar la memoria (un `.docx` de 1,5 MB puede descomprimir 250 MB) y permite acotar el costo de cada documento. Al alcanzar un límite **no se rechaza el archivo**: se entrega lo leído hasta ahí, con un aviso en `warnings`.
+Cada lectura tiene un presupuesto: cuánto se puede descomprimir en total (todas las partes del `.docx` o todos los flujos del PDF, incluidos los flujos de objetos), cuántas páginas de PDF se leen y cuánto texto se junta (cuerpo primero; después encabezados, pies, notas y comentarios). Protege contra archivos hechos para agotar la memoria (un `.docx` de 1,5 MB puede descomprimir 250 MB) y permite acotar el costo de cada documento. Al alcanzar un límite **no se rechaza el archivo**: se entrega lo leído hasta ahí, con un aviso en `warnings`. La excepción es un archivo que agota el presupuesto de descompresión antes de llegar al contenido (por ejemplo, con el cuerpo detrás de una bomba): ahí la lectura falla con un error que dice que se alcanzó el límite. En Word el cuerpo se descomprime antes que estilos y numeración, así que una bomba en esas partes no impide leerlo.
 
 | Límite | Por defecto | Web (`limits`) | Consola |
 |---|---|---|---|
@@ -292,11 +292,13 @@ Cada lectura tiene un presupuesto: cuánto se puede descomprimir en total (todas
 const doc = await docToJson(bytes, { limits: { maxDecompressedMB: 32, maxPages: 500 } });
 ```
 
+Los límites se pasan en cada conversión y no quedan para la siguiente. El límite de texto se aplica mientras se lee un `.docx`, no solo al final: lo que no cabe ni siquiera se junta en memoria. Un `doc2json.wasm` anterior a esta versión no admite límites; con él, pedir `limits` da error en vez de ignorarlos.
+
 Los valores por defecto son holgados: en 900 documentos de oficina reales el máximo fue 40 MB descomprimidos (mediana 0,7 MB), 572 páginas y 2,5 millones de caracteres, y con ellos la salida es idéntica byte a byte a la de una lectura sin límites. Con un `.docx` de 1,5 MB que descomprime 250 MB, la memoria máxima del proceso pasa de 2,9 GB (sin presupuesto) a 875 MB por defecto y a 464 MB con `maxDecompressedMB: 32`. En Rust: `doc2json::read_with_limits(bytes, Limits { … })`.
 
 ### El `.wasm` sin el cargador
 
-Quien llame al módulo directamente (sin `doc2json.js`) usa `doc_convert(ptr, largo, modo)`. El byte bajo de `modo` es la operación y los bits 8 a 31 su parámetro (`operación | (parámetro << 8)`):
+Quien llame al módulo directamente (sin `doc2json.js`) usa `doc_convert(ptr, largo, modo, mb, paginas, caracteres)`: los tres últimos son los límites de recursos de esa conversión (0 = valor por defecto). El byte bajo de `modo` es la operación y los bits 8 a 31 su parámetro (`operación | (parámetro << 8)`):
 
 | Operación | Salida | Parámetro |
 |---|---|---|
@@ -526,7 +528,7 @@ Cada lector se comparó contra la librería de referencia de su formato, sobre a
 - 1.500 PDF (6.127 páginas) y 400 Word reales: ningún fallo ni cuelgue; 51 ms por archivo en promedio.
 - 162 presentaciones y 1.003 planillas reales: ningún fallo ni cuelgue; mediana de 39 ms por presentación y 16 ms por planilla. Los únicos errores fueron archivos de bloqueo de Office y uno truncado, con un mensaje claro.
 - 460 archivos dañados a propósito (truncados, con bytes alterados, con tramos borrados): todos terminan en lectura parcial o en un error claro.
-- Archivos "bomba" armados en `doc2json/tests/presupuesto.rs` (un `.docx` de ~250 KB que descomprime 40 MB, un PDF con un flujo que descomprime 30 MB, un PDF de 50 páginas): se cortan en el límite pedido con su aviso, sin afectar a la lectura siguiente.
+- Archivos "bomba" armados en `doc2json/tests/presupuesto.rs` (un `.docx` de ~250 KB que descomprime 40 MB, otro con la bomba en los estilos o antes del cuerpo, un PDF con un flujo que descomprime 30 MB, seis flujos que solo juntos pasan el límite, flujos LZW, ASCII85, RunLength y cadenas de filtros, un flujo de objetos, un PDF de 50 páginas): se cortan en el límite pedido con su aviso, sin afectar a la lectura siguiente.
 - En todas las herramientas, el archivo generado en el navegador es idéntico byte a byte al del ejecutable.
 
 Los scripts de comparación y los archivos con que se hizo esta validación no forman parte de este repositorio.

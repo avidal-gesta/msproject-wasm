@@ -35,7 +35,7 @@ export function init(origen) {
   return modulo.then(() => undefined);
 }
 
-/** Limites para doc_set_limits: [MB descomprimidos, paginas, caracteres]; 0 = valor por defecto. */
+/** Limites de una conversion: [MB descomprimidos, paginas, caracteres]; 0 = valor por defecto. */
 function limites(opciones) {
   const l = (opciones && opciones.limits) || {};
   const entero = (v, nombre) => {
@@ -55,14 +55,17 @@ async function convertir(archivo, modo, opciones) {
   if (!instancia) instancia = modulo.then((m) => WebAssembly.instantiate(m, {})).then((i) => i.exports);
   const usada = instancia;
   const x = await usada;
+  // Un doc2json.wasm anterior a los limites recibe solo tres argumentos y los ignoraria en silencio.
+  if (lim.some((v) => v !== 0) && x.doc_convert.length < 6) {
+    throw new Error('Este doc2json.wasm no admite limites de recursos (limits): actualicelo a la version de este cargador.');
+  }
   // Desde aqui no hay ningun await: dos conversiones simultaneas no se mezclan dentro del modulo.
   try {
     const ptr = x.doc_alloc(entrada.length);
     if (entrada.length && !ptr) throw new Error('No hay memoria suficiente para un archivo de este tamano.');
     new Uint8Array(x.memory.buffer, ptr, entrada.length).set(entrada);
-    // Los limites se fijan en cada conversion: los de una llamada no quedan para la siguiente.
-    if (x.doc_set_limits) x.doc_set_limits(lim[0], lim[1], lim[2]);
-    const estado = x.doc_convert(ptr, entrada.length, modo);
+    // Los limites van como argumentos de cada conversion: no quedan para la siguiente.
+    const estado = x.doc_convert(ptr, entrada.length, modo, lim[0], lim[1], lim[2]);
     // Copia: la memoria del modulo se reutiliza en la conversion siguiente.
     const salida = new Uint8Array(x.memory.buffer, x.doc_result_ptr(), x.doc_result_len()).slice();
     x.doc_free(ptr, entrada.length);

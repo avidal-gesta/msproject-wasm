@@ -104,7 +104,8 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
 
 /// Lee un documento Word, PDF, PowerPoint o Excel sin pasar los limites dados: datos descomprimidos en total,
 /// paginas y caracteres de texto. Al alcanzar uno, entrega lo leido hasta ahi con un aviso en
-/// `warnings`; no falla.
+/// `warnings`. Si el presupuesto de descompresion se agota antes de llegar al contenido, falla
+/// con un error que lo dice (en vez del error generico del lector).
 pub fn read_with_limits(bytes: &[u8], limits: budget::Limits) -> Result<Document, String> {
     read_with_options(bytes, limits, false)
 }
@@ -120,51 +121,30 @@ pub fn read_with_options(bytes: &[u8], limits: budget::Limits, images: bool) -> 
         Format::Pptx => pptx::read_opts(bytes, images),
         Format::Xlsx => xlsx::read_opts(bytes, images),
     };
-    let (_, decompressed_hit) = budget::end();
-    let mut d = result?;
-    if decompressed_hit {
+    let spent = budget::end();
+    let mut d = match result {
+        Ok(d) => d,
+        Err(e) if spent.decompressed_hit => return Err(budget::decompressed_error(limits.max_decompressed, &e)),
+        Err(e) => return Err(e),
+    };
+    if spent.decompressed_hit {
         d.warnings.push(budget::decompressed_warning(limits.max_decompressed));
     }
-    limit_text(&mut d, limits.max_chars);
+    if limit_text(&mut d, limits.max_chars) || spent.text_hit {
+        d.warnings.push(format!("El documento tiene mas texto que el limite de {} caracteres: se entrega solo la primera parte.", limits.max_chars));
+    }
     Ok(d)
 }
 
-/// Deja como maximo `max` caracteres de texto en los bloques (y en las paginas de un PDF).
-fn limit_text(d: &mut Document, max: usize) {
-    let mut total = 0usize;
-    let mut cut = None;
-    for (i, b) in d.content.iter().enumerate() {
-        let n = doc::block_text(b).chars().count();
-        if total + n > max {
-            cut = Some((i, max - total));
-            break;
-        }
-        total += n;
-    }
-    let pages_total: usize = d.pages.iter().map(|p| p.text.chars().count()).sum();
-    if cut.is_none() && pages_total <= max {
-        return;
-    }
-    if let Some((i, left)) = cut {
-        // El bloque que cruza el limite se corta por dentro (el texto, o las filas de una tabla)
-        // y los siguientes se descartan.
-        d.content.truncate(i + 1);
-        let b = &mut d.content[i];
-        if b.kind == doc::Kind::Table {
-            let mut used = 0usize;
-            let keep = b.rows.iter().take_while(|r| {
-                used += r.iter().map(|c| c.text.chars().count() + 1).sum::<usize>();
-                used <= left
-            });
-            let n = keep.count();
-            b.rows.truncate(n);
-        } else {
-            b.text = b.text.chars().take(left).collect();
-            b.runs.clear();
-        }
-        if (b.kind == doc::Kind::Table && b.rows.is_empty()) || (b.kind != doc::Kind::Table && b.text.is_empty()) {
-            d.content.pop();
-        }
+/// Deja como maximo `max` caracteres de texto: primero el contenido y despues las partes
+/// secundarias (encabezados, pies, notas, comentarios), en ese orden. Las paginas de un PDF
+/// repiten el texto del contenido, asi que se cuentan aparte, con su propio maximo. Devuelve si
+/// se descarto algo.
+fn limit_text(d: &mut Document, max: usize) -> bool {
+    let mut left = max;
+    let mut cut = limit_blocks(&mut d.content, &mut left);
+    for (_, blocks) in d.extras.iter_mut() {
+        cut |= limit_blocks(blocks, &mut left);
     }
     let mut left = max;
     for p in d.pages.iter_mut() {
@@ -172,10 +152,48 @@ fn limit_text(d: &mut Document, max: usize) {
         if n > left {
             p.text = p.text.chars().take(left).collect();
             p.lines.clear();
+            cut = true;
         }
         left = left.saturating_sub(n);
     }
-    d.warnings.push(format!("El documento tiene mas texto que el limite de {} caracteres: se entrega solo la primera parte.", max));
+    cut
+}
+
+/// Deja en `blocks` como maximo `left` caracteres (contados como en el texto plano, con la
+/// numeracion delante) y descuenta lo que queda. El bloque que cruza el limite se corta por
+/// dentro (el texto, o las filas de una tabla) y los siguientes se descartan.
+fn limit_blocks(blocks: &mut Vec<doc::Block>, left: &mut usize) -> bool {
+    for i in 0..blocks.len() {
+        let n = doc::block_text(&blocks[i]).chars().count();
+        if n <= *left {
+            *left -= n;
+            continue;
+        }
+        let room = std::mem::take(left);
+        blocks.truncate(i + 1);
+        let b = &mut blocks[i];
+        let keep = if b.kind == doc::Kind::Table {
+            let mut used = 0usize;
+            let n = b.rows.iter().take_while(|r| {
+                used += r.iter().map(|c| c.text.chars().count() + 1).sum::<usize>();
+                used <= room
+            });
+            let n = n.count();
+            b.rows.truncate(n);
+            n > 0
+        } else {
+            // La numeracion o vineta ("1.1 ") tambien cuenta.
+            let marker = b.marker.as_deref().filter(|m| !m.is_empty()).map_or(0, |m| m.chars().count() + 1);
+            b.text = b.text.chars().take(room.saturating_sub(marker)).collect();
+            b.runs.clear();
+            !b.text.is_empty()
+        };
+        if !keep {
+            blocks.pop();
+        }
+        return true;
+    }
+    false
 }
 
 /// Lee un documento y extrae ademas sus imagenes: cada una de `Document::images` trae sus
@@ -201,4 +219,34 @@ pub fn to_chunks_json(bytes: &[u8], max_chars: usize) -> Result<String, String> 
     let d = read(bytes)?;
     let size = if max_chars == 0 { markdown::DEFAULT_CHUNK } else { max_chars };
     Ok(markdown::chunks_json(&d, &markdown::chunks(&d, size)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use doc::{Block, Kind};
+
+    fn item(marker: &str, text: &str) -> Block {
+        Block { kind: Kind::ListItem, marker: Some(marker.into()), text: text.into(), ..Block::default() }
+    }
+
+    fn total(d: &Document) -> usize {
+        d.content.iter().chain(d.extras.iter().flat_map(|(_, b)| b.iter())).map(|b| doc::block_text(b).chars().count()).sum()
+    }
+
+    #[test]
+    fn el_limite_cuenta_la_numeracion_y_sigue_en_las_notas() {
+        // "1.1 abcdef" son 10 caracteres; la nota, 5.
+        let mut d = Document { content: vec![item("1.1", "abcdef")], extras: vec![("footnotes", vec![Block { text: "nota1".into(), ..Block::default() }])], ..Document::default() };
+        assert!(!limit_text(&mut d, 15));
+        assert!(limit_text(&mut d, 12));
+        assert_eq!(total(&d), 12);
+        assert_eq!(d.extras[0].1[0].text, "no");
+        // Con 6 caracteres solo cabe "1.1 ab"; la nota se descarta.
+        assert!(limit_text(&mut d, 6));
+        assert_eq!((doc::block_text(&d.content[0]).as_str(), d.extras[0].1.len()), ("1.1 ab", 0));
+        // Si no cabe ni la numeracion, el bloque se quita.
+        assert!(limit_text(&mut d, 3));
+        assert!(d.content.is_empty());
+    }
 }

@@ -892,7 +892,7 @@ mod revision {
     }
 
     fn una_celda(t: &str) -> Block {
-        Block { kind: Kind::Table, rows: vec![vec![Cell { text: t.into(), colspan: 1, rowspan: 1, merged: false }]], ..Block::default() }
+        Block { kind: Kind::Table, rows: vec![vec![Cell { text: t.into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new() }]], ..Block::default() }
     }
 
     fn doc(content: Vec<Block>) -> Document {

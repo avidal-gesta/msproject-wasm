@@ -456,7 +456,12 @@ impl<'a> Reader<'a> {
         self.extent = None;
 
         fn push(text: &mut String, runs: &mut Vec<Run>, s: &str, fmt: &RunFmt, link: &Option<String>) {
-            if s.is_empty() || fmt.hidden {
+            if fmt.hidden {
+                return;
+            }
+            // Con un limite de caracteres, lo que no cabe ni siquiera se junta (acota la memoria).
+            let s = crate::budget::take_text(s);
+            if s.is_empty() {
                 return;
             }
             text.push_str(s);
@@ -856,10 +861,11 @@ pub fn read_opts(data: &[u8], images: bool) -> Result<Document, String> {
         r.rels.insert(id, path);
     }
     let first = |k: &str, default: &str| parts.get(k).and_then(|v| v.first().cloned()).unwrap_or_else(|| resolve(&dir, default));
+    // El cuerpo se descomprime antes que estilos y numeracion: si un archivo agota el presupuesto
+    // de descompresion (`budget`) en esas partes, el texto ya esta leido.
+    let src = zip.read_text(&main).ok_or("No se pudo leer el contenido del documento.")?;
     r.load_styles(&first("styles", "styles.xml"));
     r.load_numbering(&first("numbering", "numbering.xml"));
-
-    let src = zip.read_text(&main).ok_or("No se pudo leer el contenido del documento.")?;
     let mut doc = Document { kind: "docx", ..Document::default() };
     properties(&zip, &mut doc);
 
