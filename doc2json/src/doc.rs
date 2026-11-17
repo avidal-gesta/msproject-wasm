@@ -35,6 +35,8 @@ pub struct Cell {
     pub rowspan: u32,
     /// Celda cubierta por una combinacion vertical iniciada mas arriba.
     pub merged: bool,
+    /// Imagenes de la celda (su `id` en la lista de imagenes), en orden.
+    pub images: Vec<u32>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -53,6 +55,8 @@ pub struct Block {
     pub rows: Vec<Vec<Cell>>,
     /// Imagen: nombre del archivo incrustado.
     pub name: Option<String>,
+    /// Imagen: su `id` en la lista de imagenes del documento.
+    pub image: Option<u32>,
     /// Nota al pie o comentario: numero o autor.
     pub label: Option<String>,
     /// PDF: tamano de letra en puntos y si esta en negrita.
@@ -93,6 +97,59 @@ pub struct OutlineItem {
     pub page: Option<u32>,
 }
 
+/// Un lugar donde aparece una imagen, en puntos (1/72 de pulgada).
+#[derive(Clone, Default, Debug)]
+pub struct Place {
+    /// PDF: pagina.
+    pub page: Option<u32>,
+    /// PDF: esquina superior izquierda, medida desde la esquina superior izquierda de la pagina
+    /// en su orientacion de lectura (igual que `y` de las lineas).
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    /// Ancho y alto con que se muestra.
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Una imagen del documento: una por archivo o por objeto, aunque se muestre varias veces.
+#[derive(Clone, Default, Debug)]
+pub struct Image {
+    /// Desde 1, en orden de aparicion. Los bloques `image` la citan con este numero.
+    pub id: u32,
+    /// "png", "jpeg", "gif", "bmp", "tiff", "emf", "wmf", "svg", "jp2", "jbig2", "ccitt"...
+    pub format: &'static str,
+    /// Pixeles. En PDF siempre; en Word, solo al extraer (hay que leer el archivo).
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Nombre del archivo dentro del documento (Word) o del recurso (PDF).
+    pub name: Option<String>,
+    /// Texto alternativo (el primero que no este vacio).
+    pub alt: String,
+    pub places: Vec<Place>,
+    /// El archivo de la imagen, solo cuando se pide extraerlas.
+    pub data: Option<Vec<u8>>,
+    /// Por que no se entrega el archivo (formato que no se convierte, imagen demasiado grande...).
+    pub note: Option<String>,
+}
+
+impl Image {
+    pub fn mime(&self) -> &'static str {
+        match self.format {
+            "png" => "image/png",
+            "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            "tiff" => "image/tiff",
+            "svg" => "image/svg+xml",
+            "webp" => "image/webp",
+            "emf" => "image/emf",
+            "wmf" => "image/wmf",
+            "jp2" => "image/jp2",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct Document {
     pub kind: &'static str,
@@ -103,6 +160,8 @@ pub struct Document {
     /// Partes secundarias: encabezados, pies, notas al pie, notas finales, comentarios.
     pub extras: Vec<(&'static str, Vec<Block>)>,
     pub outline: Vec<OutlineItem>,
+    /// Imagenes, sin repetir: Word las cita desde bloques `image`; en PDF se ubican por pagina.
+    pub images: Vec<Image>,
     pub warnings: Vec<String>,
 }
 
@@ -189,6 +248,9 @@ fn block_json(b: &Block, full: bool) -> String {
                             if c.rowspan > 1 {
                                 co.int("rowspan", c.rowspan as i64);
                             }
+                            if !c.images.is_empty() {
+                                co.raw("images", &json::array(&c.images.iter().map(|i| i.to_string()).collect::<Vec<_>>()));
+                            }
                             if c.merged {
                                 co.bool("merged", true);
                             }
@@ -202,6 +264,9 @@ fn block_json(b: &Block, full: bool) -> String {
         }
         Kind::PageBreak => {}
         Kind::Image => {
+            if let Some(id) = b.image {
+                o.int("image", id as i64);
+            }
             o.opt("name", b.name.as_deref());
             o.opt("alt", Some(b.text.as_str()));
         }
@@ -246,7 +311,71 @@ fn block_json(b: &Block, full: bool) -> String {
 
 /// Serializa el documento. Con `full` se agregan estilo, alineacion, tramos con formato y,
 /// en PDF, las lineas de cada pagina con su posicion.
+/// Datos de una imagen (sin sus bytes). `offset`/`length`: ubicacion de los bytes cuando se
+/// entregan aparte (WebAssembly).
+pub fn image_json_with(img: &Image, at: Option<(usize, usize)>) -> String {
+    let mut o = Obj::new();
+    o.int("id", img.id as i64).str("format", img.format);
+    if let (Some(w), Some(h)) = (img.width, img.height) {
+        o.int("width", w as i64).int("height", h as i64);
+    }
+    o.opt("name", img.name.as_deref());
+    if !img.alt.is_empty() {
+        o.str("alt", &img.alt);
+    }
+    if !img.places.is_empty() {
+        let places: Vec<String> = img
+            .places
+            .iter()
+            .map(|p| {
+                let mut po = Obj::new();
+                if let Some(n) = p.page {
+                    po.int("page", n as i64);
+                }
+                if let (Some(x), Some(y)) = (p.x, p.y) {
+                    po.num("x", x).num("y", y);
+                }
+                po.num("w", p.w).num("h", p.h);
+                po.end()
+            })
+            .collect();
+        o.raw("places", &json::array(&places));
+    }
+    if let Some(d) = &img.data {
+        o.str("mime", img.mime()).int("size", d.len() as i64);
+    }
+    if let Some((offset, length)) = at {
+        o.int("offset", offset as i64).int("length", length as i64);
+    }
+    o.opt("note", img.note.as_deref());
+    o.end()
+}
+
 pub fn to_json(d: &Document, full: bool) -> String {
+    to_json_at(d, full, &|_| None)
+}
+
+/// JSON y, a continuacion, los bytes de las imagenes extraidas: cada imagen del JSON lleva
+/// `offset` y `length` dentro de ese bloque. Se omiten los bytes de las imagenes cuyo lado menor
+/// tiene menos de `min_side` pixeles (siguen en la lista, sin `offset`).
+pub fn to_json_with_images(d: &Document, full: bool, min_side: u32) -> (String, Vec<u8>) {
+    let mut blob = Vec::new();
+    let mut at: Vec<Option<(usize, usize)>> = Vec::with_capacity(d.images.len());
+    for img in &d.images {
+        let small = matches!((img.width, img.height), (Some(w), Some(h)) if w.min(h) < min_side);
+        match &img.data {
+            Some(bytes) if !small => {
+                at.push(Some((blob.len(), bytes.len())));
+                blob.extend_from_slice(bytes);
+            }
+            _ => at.push(None),
+        }
+    }
+    let json = to_json_at(d, full, &|img: &Image| at.get(img.id as usize - 1).copied().flatten());
+    (json, blob)
+}
+
+fn to_json_at(d: &Document, full: bool, at: &dyn Fn(&Image) -> Option<(usize, usize)>) -> String {
     let mut meta = Obj::new();
     for (k, v) in &d.meta {
         match v {
@@ -322,6 +451,10 @@ pub fn to_json(d: &Document, full: bool) -> String {
             })
             .collect();
         root.raw("outline", &json::array(&items));
+    }
+    if !d.images.is_empty() {
+        let items: Vec<String> = d.images.iter().map(|i| image_json_with(i, at(i))).collect();
+        root.raw("images", &json::array(&items));
     }
     for (key, blocks) in &d.extras {
         if !blocks.is_empty() {

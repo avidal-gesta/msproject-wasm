@@ -2,8 +2,12 @@
 //!   1. `ptr = doc_alloc(n)` y copiar los bytes del documento en la memoria del modulo.
 //!   2. `estado = doc_convert(ptr, n, modo)`: modo 0 = JSON, 1 = JSON completo, 2 = Markdown,
 //!      3 = fragmentos en JSON (el tamano maximo en caracteres va en los bits altos: `3 | (n << 8)`).
+//!      Sumando 4 al modo 0 o 1 se extraen tambien las imagenes, y `modo | (lado_minimo << 8)`
+//!      omite los bytes de las imagenes mas chicas que eso: el resultado es `[u32 largo][JSON][bytes]`.
 //!   3. Leer `doc_result_len()` bytes desde `doc_result_ptr()`:
-//!      con estado 0 es el JSON; con estado 1 es el mensaje de error, ambos en UTF-8.
+//!      con estado 0 es el JSON en UTF-8 o, con imagenes, `[largo del JSON: u32 LE][JSON][bytes de
+//!      las imagenes]` (cada imagen del JSON trae su `offset` y `length` en ese bloque final);
+//!      con estado 1 es el mensaje de error en UTF-8.
 //!   4. `doc_free(ptr, n)`.
 //!
 //! Opcional, antes de convertir: `doc_set_limits(mb, paginas, caracteres)` fija el presupuesto de
@@ -52,22 +56,29 @@ pub unsafe extern "C" fn doc_free(ptr: *mut u8, len: usize) {
 pub unsafe extern "C" fn doc_convert(ptr: *const u8, len: usize, mode: u32) -> u32 {
     let input: &[u8] = if ptr.is_null() || len == 0 { &[] } else { std::slice::from_raw_parts(ptr, len) };
     let limits = unsafe { (*std::ptr::addr_of!(LIMITS)).unwrap_or_default() };
-    let result = match mode & 0xff {
-        0..=3 => crate::read_with_limits(input, limits).map(|d| match mode & 0xff {
-            0 | 1 => crate::doc::to_json(&d, mode & 0xff == 1),
-            2 => crate::markdown::to_markdown(&d),
-            _ => {
-                let size = match (mode >> 8) as usize {
-                    0 => crate::markdown::DEFAULT_CHUNK,
-                    n => n,
-                };
-                crate::markdown::chunks_json(&d, &crate::markdown::chunks(&d, size))
-            }
+    let kind = mode & 0xff;
+    let result = match kind {
+        0 | 1 => crate::read_with_limits(input, limits).map(|d| crate::doc::to_json(&d, kind == 1).into_bytes()),
+        2 => crate::read_with_limits(input, limits).map(|d| crate::markdown::to_markdown(&d).into_bytes()),
+        3 => crate::read_with_limits(input, limits).map(|d| {
+            let size = match (mode >> 8) as usize {
+                0 => crate::markdown::DEFAULT_CHUNK,
+                n => n,
+            };
+            crate::markdown::chunks_json(&d, &crate::markdown::chunks(&d, size)).into_bytes()
+        }),
+        4 | 5 => crate::read_with_options(input, limits, true).map(|doc| {
+            let (json, blob) = crate::doc::to_json_with_images(&doc, kind == 5, mode >> 8);
+            let mut out = Vec::with_capacity(4 + json.len() + blob.len());
+            out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+            out.extend_from_slice(json.as_bytes());
+            out.extend_from_slice(&blob);
+            out
         }),
         _ => Err("Modo de conversion desconocido.".to_string()),
     };
     let (status, bytes) = match result {
-        Ok(s) => (0, s.into_bytes()),
+        Ok(b) => (0, b),
         Err(e) => (1, e.into_bytes()),
     };
     // WebAssembly aqui es de un solo hilo: no hay acceso concurrente a RESULT.

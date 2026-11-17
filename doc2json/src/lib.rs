@@ -13,11 +13,15 @@
 pub mod budget;
 pub mod doc;
 pub mod docx;
+pub mod ccitt;
+pub mod image;
 pub mod inflate;
+pub mod jbig2;
 pub mod json;
 pub mod markdown;
 pub mod pdf;
 pub mod pptx;
+pub mod png;
 pub mod symbols;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
@@ -102,11 +106,17 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
 /// paginas y caracteres de texto. Al alcanzar uno, entrega lo leido hasta ahi con un aviso en
 /// `warnings`; no falla.
 pub fn read_with_limits(bytes: &[u8], limits: budget::Limits) -> Result<Document, String> {
+    read_with_options(bytes, limits, false)
+}
+
+/// Como `read_with_limits`; con `images` extrae ademas los bytes de cada imagen de
+/// `Document::images` (en `data`, o el motivo por el que no, en `note`).
+pub fn read_with_options(bytes: &[u8], limits: budget::Limits, images: bool) -> Result<Document, String> {
     let format = detect(bytes)?;
     budget::begin(limits);
     let result = match format {
-        Format::Docx => docx::read(bytes),
-        Format::Pdf => pdf::read(bytes),
+        Format::Docx => docx::read_opts(bytes, images),
+        Format::Pdf => pdf::read_opts(bytes, true, images),
         Format::Pptx => pptx::read(bytes),
         Format::Xlsx => xlsx::read(bytes),
     };
@@ -166,6 +176,12 @@ fn limit_text(d: &mut Document, max: usize) {
         left = left.saturating_sub(n);
     }
     d.warnings.push(format!("El documento tiene mas texto que el limite de {} caracteres: se entrega solo la primera parte.", max));
+}
+
+/// Lee un documento y extrae ademas sus imagenes: cada una de `Document::images` trae sus
+/// bytes en `data` (o el motivo por el que no, en `note`).
+pub fn read_with_images(bytes: &[u8]) -> Result<Document, String> {
+    read_with_options(bytes, budget::Limits::default(), true)
 }
 
 /// Convierte un documento a JSON. Con `full` se incluyen estilos, formato de los tramos de

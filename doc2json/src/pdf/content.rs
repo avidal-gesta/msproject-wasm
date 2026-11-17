@@ -61,10 +61,22 @@ struct Marked {
     art: u8,
 }
 
+/// Una imagen dibujada: su objeto, su diccionario y la transformacion con que se dibujo.
+pub struct ImageUse {
+    /// Numero y generacion del objeto (las imagenes se reconocen por el, aunque se repitan).
+    pub key: Option<(u32, u16)>,
+    pub dict: Dict,
+    pub ctm: Matrix,
+}
+
 #[derive(Default)]
 pub struct PageText {
     pub items: Vec<Item>,
     pub images: usize,
+    /// Imagenes de objeto dibujadas (`Do`), en orden.
+    pub uses: Vec<ImageUse>,
+    /// Imagenes incrustadas en el contenido (`BI ... EI`): se cuentan, no se extraen.
+    pub inline_images: usize,
     /// Glifos sin correspondencia Unicode conocida.
     pub unmapped: usize,
 }
@@ -386,6 +398,7 @@ impl<'p, 'a> Interp<'p, 'a> {
                     };
                     lx.pos = end;
                     self.out.images += 1;
+                    self.out.inline_images += 1;
                 }
                 _ => {}
             }
@@ -398,8 +411,8 @@ impl<'p, 'a> Interp<'p, 'a> {
             Some(x) => x,
             None => return,
         };
-        let obj = match xobjects.get(name) {
-            Some(o) => self.pdf.resolve(o),
+        let (obj, key) = match xobjects.get(name) {
+            Some(o) => (self.pdf.resolve(o), if let Obj::Ref(n, g) = o { Some((*n, *g)) } else { None }),
             None => return,
         };
         let dict = match obj.as_dict() {
@@ -407,7 +420,12 @@ impl<'p, 'a> Interp<'p, 'a> {
             None => return,
         };
         match dict.get("Subtype").and_then(|s| s.as_name()) {
-            Some("Image") => self.out.images += 1,
+            Some("Image") => {
+                self.out.images += 1;
+                if self.out.uses.len() < 100_000 {
+                    self.out.uses.push(ImageUse { key, dict: dict.clone(), ctm: st.ctm });
+                }
+            }
             Some("Form") if self.depth < 12 => {
                 let data = match self.pdf.stream_data(&obj) {
                     Some(d) => d,

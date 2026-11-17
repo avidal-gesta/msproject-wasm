@@ -22,6 +22,10 @@ export interface JsonOptions {
   full?: boolean;
   /** Limites de recursos de esta conversion (por ejemplo, mas bajos en una funcion con poca memoria). */
   limits?: Limits;
+  /** Solo `docToJson`: extrae tambien las imagenes; cada una trae sus bytes en `data`. */
+  images?: boolean;
+  /** Con `images`: no entrega los bytes de las imagenes cuyo lado menor tiene menos pixeles que esto (iconos, lineas). */
+  minSide?: number;
 }
 
 /** Descarga y compila el modulo. Llamarla varias veces no lo descarga de nuevo. */
@@ -106,6 +110,8 @@ export interface DocCell {
   rowspan?: number;
   /** Celda cubierta por una combinacion vertical iniciada mas arriba. */
   merged?: true;
+  /** Solo Word: imagenes de la celda (su `id` en `images`). */
+  images?: number[];
 }
 
 export interface DocRun {
@@ -131,7 +137,8 @@ export interface DocBlock {
   text?: string;
   /** Tablas: filas de celdas. */
   rows?: DocCell[][];
-  /** Imagenes: nombre del archivo incrustado y texto alternativo. */
+  /** Imagenes: su `id` en `images`, nombre del archivo incrustado y texto alternativo. */
+  image?: number;
   name?: string;
   alt?: string;
   /** PDF: pagina. PowerPoint: diapositiva. Excel: numero de hoja. */
@@ -168,6 +175,35 @@ export interface DocOutlineItem {
   page?: number;
 }
 
+/** Un lugar donde se muestra una imagen, en puntos (1/72 de pulgada). */
+export interface DocImagePlace {
+  /** Solo PDF. */
+  page?: number;
+  /** Solo PDF: esquina superior izquierda, desde la esquina superior izquierda de la pagina en su orientacion de lectura. */
+  x?: number;
+  y?: number;
+  w: number;
+  h: number;
+}
+
+/** Una imagen del documento (una por archivo u objeto, aunque se muestre varias veces). */
+export interface DocImage {
+  id: number;
+  format: 'png' | 'jpeg' | 'gif' | 'bmp' | 'tiff' | 'emf' | 'wmf' | 'svg' | 'webp' | 'jp2' | 'jxr' | 'jbig2' | 'desconocido';
+  /** Pixeles. En PDF siempre; en Word, solo con `images: true`. */
+  width?: number;
+  height?: number;
+  name?: string;
+  alt?: string;
+  places?: DocImagePlace[];
+  /** Con `images: true`, si se extrajo. */
+  mime?: string;
+  size?: number;
+  data?: Uint8Array;
+  /** Por que no se entrega el archivo (JBIG2, espacio de color no soportado, demasiado grande...). */
+  note?: string;
+}
+
 export interface DocDocument {
   type: 'docx' | 'pdf' | 'pptx' | 'xlsx';
   metadata: DocMetadata;
@@ -189,6 +225,8 @@ export interface DocDocument {
   comments?: DocBlock[];
   /** Solo PowerPoint: notas del orador. */
   notes?: DocBlock[];
+  /** Imagenes sin repetir. Word las cita desde bloques `image`; en PDF se ubican con `places`. */
+  images?: DocImage[];
   /** Avisos: paginas escaneadas sin texto, indice reconstruido, fuentes ilegibles. */
   warnings?: string[];
   /** Todo el texto plano. */

@@ -616,7 +616,7 @@ impl<'s> Builder<'s> {
                 if rs > 1 {
                     carry.insert(col, (rs - 1, cs));
                 }
-                row.push(Cell { text, colspan: cs, rowspan: rs, merged: false });
+                row.push(Cell { text, colspan: cs, rowspan: rs, merged: false, images: Vec::new() });
                 col += cs;
             }
             // Combinaciones que siguen a la derecha de la ultima celda de la fila.

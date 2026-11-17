@@ -2,6 +2,7 @@
 //
 //   await init('/doc2json.wasm');          // una sola vez (en Node: init(bytes del .wasm))
 //   const doc = await docToJson(archivo);  // { type, metadata, content, text, ... }
+//   const conImagenes = await docToJson(archivo, { images: true });  // images[i].data: Uint8Array
 //
 // Acepta .docx, .pdf, .pptx y .xlsx; el formato se reconoce por el contenido. La conversion ocurre donde
 // corre este codigo: el archivo no se envia a ningun servidor.
@@ -62,9 +63,10 @@ async function convertir(archivo, modo, opciones) {
     // Los limites se fijan en cada conversion: los de una llamada no quedan para la siguiente.
     if (x.doc_set_limits) x.doc_set_limits(lim[0], lim[1], lim[2]);
     const estado = x.doc_convert(ptr, entrada.length, modo);
-    const salida = new TextDecoder().decode(new Uint8Array(x.memory.buffer, x.doc_result_ptr(), x.doc_result_len()));
+    // Copia: la memoria del modulo se reutiliza en la conversion siguiente.
+    const salida = new Uint8Array(x.memory.buffer, x.doc_result_ptr(), x.doc_result_len()).slice();
     x.doc_free(ptr, entrada.length);
-    if (estado !== 0) throw new Error(salida);
+    if (estado !== 0) throw new Error(new TextDecoder().decode(salida));
     return salida;
   } catch (e) {
     if (e instanceof WebAssembly.RuntimeError) {
@@ -78,18 +80,39 @@ async function convertir(archivo, modo, opciones) {
 }
 
 /** Convierte un .docx, .pdf, .pptx o .xlsx en JSON, como texto. Con `full` agrega estilos, tramos con formato y lineas de PDF. */
-export function docToJsonText(archivo, opciones) {
-  return convertir(archivo, opciones && opciones.full ? 1 : 0, opciones);
+export async function docToJsonText(archivo, opciones) {
+  return new TextDecoder().decode(await convertir(archivo, opciones && opciones.full ? 1 : 0, opciones));
 }
 
-/** Convierte un .docx, .pdf, .pptx o .xlsx en un objeto con metadatos, bloques de contenido y texto plano. */
+function modoImagenes(opciones) {
+  const lado = opciones.minSide == null ? 0 : opciones.minSide;
+  if (!Number.isInteger(lado) || lado < 0 || lado > 0xffffff) throw new RangeError('minSide debe ser un entero entre 0 y 16777215.');
+  return (opciones.full ? 1 : 0) | 4 | (lado << 8);
+}
+
+/**
+ * Convierte un .docx, .pdf, .pptx o .xlsx en un objeto con metadatos, bloques de contenido y
+ * texto plano. Con `images: true` cada imagen de `images` trae sus bytes en `data` (PNG, JPEG,
+ * TIFF...; ver `format` y `mime`); con `minSide` se omiten los bytes de las imagenes con un lado
+ * menor a eso.
+ */
 export async function docToJson(archivo, opciones) {
-  return JSON.parse(await docToJsonText(archivo, opciones));
+  if (!opciones || !opciones.images) return JSON.parse(await docToJsonText(archivo, opciones));
+  const salida = await convertir(archivo, modoImagenes(opciones), opciones);
+  const largo = new DataView(salida.buffer, salida.byteOffset, 4).getUint32(0, true);
+  const doc = JSON.parse(new TextDecoder().decode(salida.subarray(4, 4 + largo)));
+  const bytes = salida.subarray(4 + largo);
+  for (const imagen of doc.images || []) {
+    if (imagen.offset != null) imagen.data = bytes.subarray(imagen.offset, imagen.offset + imagen.length);
+    delete imagen.offset;
+    delete imagen.length;
+  }
+  return doc;
 }
 
 /** Convierte un documento (Word, PDF, PowerPoint o Excel) en Markdown: titulos, listas, tablas GFM y notas al pie. */
-export function docToMarkdown(archivo, opciones) {
-  return convertir(archivo, 2, opciones);
+export async function docToMarkdown(archivo, opciones) {
+  return new TextDecoder().decode(await convertir(archivo, 2, opciones));
 }
 
 /**
@@ -99,5 +122,5 @@ export function docToMarkdown(archivo, opciones) {
 export async function docToChunks(archivo, opciones) {
   const n = Math.floor((opciones && opciones.maxChars) || 0);
   if (n < 0 || n > 0xffffff) throw new RangeError('maxChars debe estar entre 1 y 16777215.');
-  return JSON.parse(await convertir(archivo, 3 + n * 256, opciones));
+  return JSON.parse(new TextDecoder().decode(await convertir(archivo, 3 + n * 256, opciones)));
 }

@@ -465,12 +465,12 @@ fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str) 
             if let Some(&w) = covered.get(&(i, j)) {
                 // Excel solo muestra el valor de la primera celda de una combinacion.
                 if w > 0 {
-                    line.push(Cell { text: String::new(), colspan: w, rowspan: 1, merged: true });
+                    line.push(Cell { text: String::new(), colspan: w, rowspan: 1, merged: true, images: Vec::new() });
                 }
                 continue;
             }
             let (rowspan, colspan) = span.get(&(i, j)).copied().unwrap_or((1, 1));
-            line.push(Cell { text, colspan, rowspan, merged: false });
+            line.push(Cell { text, colspan, rowspan, merged: false, images: Vec::new() });
         }
         // Las celdas vacias del final de la fila no aportan: en hojas anchas y ralas son la mayoria.
         while line.last().is_some_and(|c| c.text.is_empty() && !c.merged && c.colspan == 1 && c.rowspan == 1) {

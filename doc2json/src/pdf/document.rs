@@ -523,6 +523,16 @@ impl<'a> Pdf<'a> {
 
     /// Datos de un flujo con sus filtros aplicados. `None` si usa un filtro no soportado.
     pub fn stream_data(&self, obj: &Obj) -> Option<Vec<u8>> {
+        let (mut data, chain) = self.stream_parts(obj)?;
+        for (name, parms, _) in &chain {
+            data = filters::apply(name, &data, parms)?;
+        }
+        Some(data)
+    }
+
+    /// Datos de un flujo ya descifrados pero sin filtrar, y sus filtros en orden de aplicacion con
+    /// sus parametros (tambien el diccionario original, que piden filtros de imagen como CCITT).
+    pub fn stream_parts(&self, obj: &Obj) -> Option<(Vec<u8>, Vec<(String, Parms, Option<Dict>)>)> {
         let (dict, start, len) = match obj {
             Obj::Stream { dict, start, len } => (dict, *start, *len),
             _ => return None,
@@ -543,30 +553,35 @@ impl<'a> Pdf<'a> {
             _ => Vec::new(),
         };
         if names.is_empty() {
-            return Some(raw.to_vec());
+            return Some((raw.to_vec(), Vec::new()));
         }
         let parms_obj = match dict.get("DecodeParms").or_else(|| dict.get("DP")) {
             Some(o) => self.resolve(o),
             None => Rc::new(Obj::Null),
         };
-        let parms_at = |i: usize| -> Parms {
+        let single = names.len() == 1;
+        let parms_at = |i: usize| -> (Parms, Option<Dict>) {
             let d = match &*parms_obj {
-                Obj::Dict(d) if i == 0 || names.len() == 1 => Some(d.clone()),
+                Obj::Dict(d) if i == 0 || single => Some(d.clone()),
                 Obj::Array(a) => a.get(i).map(|o| self.resolve(o)).and_then(|o| o.as_dict().cloned()),
                 _ => None,
             };
             let mut p = Parms::default();
-            if let Some(d) = d {
-                let int = |k: &str, def: i64| self.get(&d, k).as_i64().unwrap_or(def);
+            if let Some(d) = &d {
+                let int = |k: &str, def: i64| self.get(d, k).as_i64().unwrap_or(def);
                 p = Parms { predictor: int("Predictor", 1), colors: int("Colors", 1), bits: int("BitsPerComponent", 8), columns: int("Columns", 1), early_change: int("EarlyChange", 1) };
             }
-            p
+            (p, d)
         };
-        let mut data = raw.to_vec();
-        for (i, name) in names.iter().enumerate() {
-            data = filters::apply(name, &data, &parms_at(i))?;
-        }
-        Some(data)
+        let chain = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let (p, d) = parms_at(i);
+                (name, p, d)
+            })
+            .collect();
+        Some((raw.to_vec(), chain))
     }
 
     pub fn is_encrypted(&self) -> bool {

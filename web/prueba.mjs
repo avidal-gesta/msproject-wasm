@@ -64,6 +64,38 @@ comprobar('docToChunks rechaza un tamano fuera de rango', /maxChars/.test(await 
   comprobar('limits rechaza valores invalidos', /maxPages/.test(await mensajeDeError(doc.docToJson(bytes, { limits: { maxPages: 0 } }))));
 }
 
+// PDF minimo con una imagen RGB de 2 x 2 (sin comprimir) dibujada en la pagina.
+function pdfConImagen() {
+  const partes = [];
+  const objetos = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>',
+    '<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>',
+    '<< /Length 33 >>\nstream\nq 100 0 0 50 72 600 cm /Im1 Do Q\nendstream',
+    '<< /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 12 >>\nstream\n\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\xff\nendstream',
+  ];
+  let texto = '%PDF-1.7\n';
+  objetos.forEach((o, i) => {
+    partes.push(texto.length);
+    texto += `${i + 1} 0 obj\n${o}\nendobj\n`;
+  });
+  const xref = texto.length;
+  texto += `xref\n0 ${objetos.length + 1}\n0000000000 65535 f \n${partes.map((p) => `${String(p).padStart(10, '0')} 00000 n \n`).join('')}`;
+  texto += `trailer\n<< /Size ${objetos.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Uint8Array.from(texto, (c) => c.charCodeAt(0));
+}
+
+const conImagen = await doc.docToJson(pdfConImagen(), { images: true });
+const imagen = conImagen.images && conImagen.images[0];
+comprobar('doc2json extrae la imagen de un PDF como PNG', imagen && imagen.mime === 'image/png' && imagen.data instanceof Uint8Array && imagen.data[1] === 0x50 && imagen.data.length === imagen.size);
+comprobar('doc2json ubica la imagen en la pagina', imagen && JSON.stringify(imagen.places) === '[{"page":1,"x":72,"y":142,"w":100,"h":50}]');
+comprobar('doc2json no deja offset ni length en el objeto', imagen && !('offset' in imagen) && !('length' in imagen));
+const chicas = await doc.docToJson(pdfConImagen(), { images: true, minSide: 3 });
+comprobar('minSide omite los bytes de imagenes chicas', chicas.images[0].data === undefined && chicas.images[0].width === 2);
+const sinExtraer = await doc.docToJson(pdfConImagen());
+comprobar('sin images: lista sin bytes', sinExtraer.images.length === 1 && sinExtraer.images[0].data === undefined);
+comprobar('minSide invalido se rechaza', (await mensajeDeError(doc.docToJson(pdfConImagen(), { images: true, minSide: -1 }))) !== null);
+
 comprobar('doc2json rechaza un archivo que no es documento', /no reconocido/.test(await mensajeDeError(doc.docToJson(new TextEncoder().encode('hola mundo')))));
 comprobar('doc2json rechaza un archivo vacio', /vac/.test(await mensajeDeError(doc.docToJson(new Uint8Array(0)))));
 comprobar('mpp2xlsx rechaza un archivo que no es .mpp', /no es un \.mpp/.test(await mensajeDeError(mpp.mppToXlsx(await readFile(path.join(ejemplo, 'procedimiento.pdf'))))));
