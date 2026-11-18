@@ -258,7 +258,7 @@ fn table(x: &mut Xml, rels: &HashMap<String, (String, bool)>, slide: u32) -> Blo
                     continue;
                 }
                 if let Some(r) = rows.last_mut() {
-                    r.push(Cell { text: if v_merge { String::new() } else { text }, colspan, rowspan, merged: v_merge, images: Vec::new() });
+                    r.push(Cell { text: if v_merge { String::new() } else { text }, colspan, rowspan, merged: v_merge, images: Vec::new(), blocks: Vec::new() });
                 }
             }
             Ev::End("a:tbl") => break,

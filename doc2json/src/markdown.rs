@@ -791,7 +791,7 @@ mod tests {
     }
 
     fn celda(t: &str) -> Cell {
-        Cell { text: t.into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new() }
+        Cell { text: t.into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new(), blocks: Vec::new() }
     }
 
     fn tabla(rows: Vec<Vec<Cell>>) -> Block {
@@ -886,8 +886,8 @@ mod filas_largas {
     #[test]
     fn una_fila_mas_grande_que_el_fragmento_se_reparte() {
         let larga = "Verificar el bloqueo antes de intervenir el equipo. ".repeat(60); // ~3100 caracteres
-        let fila = vec![Cell { text: "1".into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new() }, Cell { text: larga.clone(), colspan: 1, rowspan: 1, merged: false, images: Vec::new() }];
-        let cab = vec![Cell { text: "Paso".into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new() }, Cell { text: "Riesgos y controles".into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new() }];
+        let fila = vec![Cell { text: "1".into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new(), blocks: Vec::new() }, Cell { text: larga.clone(), colspan: 1, rowspan: 1, merged: false, images: Vec::new(), blocks: Vec::new() }];
+        let cab = vec![Cell { text: "Paso".into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new(), blocks: Vec::new() }, Cell { text: "Riesgos y controles".into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new(), blocks: Vec::new() }];
         let d = Document { kind: "docx", content: vec![Block { kind: Kind::Heading, level: 1, text: "Ejecucion".into(), ..Block::default() }, Block { kind: Kind::Table, rows: vec![cab, fila], ..Block::default() }], ..Document::default() };
         let c = chunks(&d, 1000);
         assert!(c.iter().all(|x| x.text.chars().count() <= 1000), "{:?}", c.iter().map(|x| x.text.chars().count()).collect::<Vec<_>>());
@@ -913,7 +913,7 @@ mod revision {
     }
 
     fn una_celda(t: &str) -> Block {
-        Block { kind: Kind::Table, rows: vec![vec![Cell { text: t.into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new() }]], ..Block::default() }
+        Block { kind: Kind::Table, rows: vec![vec![Cell { text: t.into(), colspan: 1, rowspan: 1, merged: false, images: Vec::new(), blocks: Vec::new() }]], ..Block::default() }
     }
 
     fn doc(content: Vec<Block>) -> Document {

@@ -41,6 +41,9 @@ pub struct Cell {
     pub merged: bool,
     /// Imagenes de la celda (su `id` en la lista de imagenes), en orden.
     pub images: Vec<u32>,
+    /// Solo Word: los bloques de la celda (parrafos con su estilo, tablas anidadas) cuando alguno es
+    /// un titulo o un encabezado. Salen en el JSON completo.
+    pub blocks: Vec<Block>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -257,6 +260,9 @@ fn block_json(b: &Block, full: bool) -> String {
                             }
                             if c.merged {
                                 co.bool("merged", true);
+                            }
+                            if full && !c.blocks.is_empty() {
+                                co.raw("blocks", &json::array(&c.blocks.iter().map(|b| block_json(b, full)).collect::<Vec<_>>()));
                             }
                             co.end()
                         })

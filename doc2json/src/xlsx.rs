@@ -446,7 +446,7 @@ fn read_sheet(src: &str, ctx: &Ctx, max_cells: usize) -> Sheet {
 
 /// Hoja muy dispersa: una tabla de dos columnas, referencia y valor, en el orden de la hoja.
 fn sparse_table(cells: Vec<(usize, usize, String)>, page: u32) -> Block {
-    let cell = |text: String| Cell { text, colspan: 1, rowspan: 1, merged: false, images: Vec::new() };
+    let cell = |text: String| Cell { text, colspan: 1, rowspan: 1, merged: false, images: Vec::new(), blocks: Vec::new() };
     let rows = cells.into_iter().map(|(r, c, v)| vec![cell(format!("{}{}", col_name(c), r)), cell(v)]).collect();
     Block { kind: Kind::Table, rows, page: Some(page), ..Block::default() }
 }
@@ -572,12 +572,12 @@ fn sheet_table(sheet: Sheet, page: u32, warnings: &mut Vec<String>, name: &str, 
             if let Some(&w) = covered.get(&(i, j)) {
                 // Excel solo muestra el valor de la primera celda de una combinacion.
                 if w > 0 {
-                    line.push(Cell { text: String::new(), colspan: w, rowspan: 1, merged: true, images: Vec::new() });
+                    line.push(Cell { text: String::new(), colspan: w, rowspan: 1, merged: true, images: Vec::new(), blocks: Vec::new() });
                 }
                 continue;
             }
             let (rowspan, colspan) = span.get(&(i, j)).copied().unwrap_or((1, 1));
-            line.push(Cell { text, colspan, rowspan, merged: false, images: Vec::new() });
+            line.push(Cell { text, colspan, rowspan, merged: false, images: Vec::new(), blocks: Vec::new() });
         }
         // Las celdas vacias del final de la fila no aportan: en hojas anchas y ralas son la mayoria.
         while line.last().is_some_and(|c| c.text.is_empty() && !c.merged && c.colspan == 1 && c.rowspan == 1) {

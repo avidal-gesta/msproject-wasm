@@ -116,6 +116,11 @@ export interface DocCell {
   merged?: true;
   /** Solo Word: imagenes de la celda (su `id` en `images`). */
   images?: number[];
+  /**
+   * Solo Word y con `full`: los bloques de la celda (parrafos con su estilo, tablas anidadas) cuando
+   * alguno es un titulo o un encabezado.
+   */
+  blocks?: DocBlock[];
 }
 
 export interface DocRun {

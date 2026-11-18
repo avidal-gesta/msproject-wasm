@@ -59,6 +59,7 @@ struct CellTmp {
     /// Some(true) = inicia una combinacion vertical; Some(false) = continua la de arriba.
     vmerge: Option<bool>,
     images: Vec<u32>,
+    blocks: Vec<Block>,
 }
 
 struct Reader<'a> {
@@ -636,7 +637,7 @@ impl<'a> Reader<'a> {
                         }
                     }
                 }
-                cells.push(Cell { text: c.text.clone(), colspan: c.colspan.max(1), rowspan, merged: c.vmerge == Some(false), images: c.images.clone() });
+                cells.push(Cell { text: c.text.clone(), colspan: c.colspan.max(1), rowspan, merged: c.vmerge == Some(false), images: c.images.clone(), blocks: c.blocks.clone() });
             }
             out.push(cells);
         }
@@ -680,6 +681,12 @@ impl<'a> Reader<'a> {
             }
         }
         collect(&blocks, &mut c.images);
+        // Los bloques se guardan solo si la celda trae un titulo o un encabezado, tambien dentro de una
+        // tabla anidada (el titulo de algunas plantillas va dentro de una tabla): asi una tabla comun no
+        // duplica su texto en memoria.
+        if blocks.iter().any(|b| matches!(b.kind, Kind::Title | Kind::Heading) || b.rows.iter().flatten().any(|c| !c.blocks.is_empty())) {
+            c.blocks = blocks;
+        }
         c
     }
 

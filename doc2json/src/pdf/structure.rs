@@ -762,7 +762,7 @@ impl<'s> Builder<'s> {
                     Slot::Pad => Cell { colspan: 1, rowspan: 1, ..Cell::default() },
                     Slot::Cell(cell) => {
                         let text = self.text(cell, &mut page);
-                        Cell { text, colspan: cell.colspan.max(1), rowspan: cell.rowspan.max(1), merged: false, images: Vec::new() }
+                        Cell { text, colspan: cell.colspan.max(1), rowspan: cell.rowspan.max(1), merged: false, images: Vec::new(), blocks: Vec::new() }
                     }
                 });
             }
